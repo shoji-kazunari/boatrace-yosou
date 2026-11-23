@@ -1,1 +1,7 @@
 lhafile
+pandas
+numpy
+pyarrow
+lightgbm
+scikit-learn
+scipy
