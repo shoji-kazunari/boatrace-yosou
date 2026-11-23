@@ -1,147 +1,171 @@
-"""モデル確率とオッズを比べて買い方を評価する。
-使い方: python3 tools/bet.py [base|ex]
+"""モデル確率とオッズを比べて、期待値ベースの買い方を全券種・賭け金の配分ごとに評価する。
+使い方: python3 tools/bet.py [tag]      # tag は model.py の出力名（既定 base）
 
-手順（すべての設定は調整期間だけで決め、試験期間は最後に1回だけ評価する）:
+手順（設定はすべて調整期間だけで決め、試験期間は最後に1回だけ見る）:
   1. 市場の確率 = 単勝オッズの逆数をレース内で正規化
-  2. 混合確率 ∝ モデル^a × 市場^b   … a, b は調整期間の1着の対数尤度で決める
-     （モデル単独より、市場の情報と組み合わせた方が確率として正確になる）
-  3. 2連単・2連複 = 混合1着確率 × 2着モデルの条件付き確率（model.py の exacta_*.parquet）
-  4. 期待値 = 混合確率 × 確定オッズ。期待値 >= θ の舟券を100円ずつ買う
-     θ と券種は調整期間の回収率で選ぶ
+  2. 混合1着確率 ∝ モデル^a × 市場^b   … a, b は調整期間の1着の対数尤度で決める
+  3. 2着 = 2着モデルの条件付き確率、3着 = λ3 で組み立て（strategies.py と同じ）
+  4. 期待値 EV = 確率 × 確定オッズ。EV >= θ の舟券を買う
+  5. 賭け金の配分を3通り比べる
+       flat   : 1点100円
+       equal  : 1レースの合計1,000円を、どれが当たっても払戻がほぼ同じになるよう 1/オッズ に比例配分
+       kelly  : 資金10万円から開始し、1/4ケリー（f = (p·o − 1)/(o − 1) の1/4）で賭ける。
+                1点は資金の2%まで。資金の推移と最大ドローダウンを出す
 
-注意: オッズは「確定オッズ」。締切前に見える値とは少し違うため、実戦では結果が少し悪くなりうる。
+注意: 確定オッズを使うので、締切前に見えるオッズで買う実戦より少し甘く出る。
+     拡連複・複勝は下限オッズで EV を計算する（控えめ）。
 """
-import itertools, json, pathlib, sqlite3, sys
+import json, pathlib, sqlite3, sys
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from backtest import Book, evaluate, fmt  # noqa: E402
+from backtest import Book  # noqa: E402
+import strategies as S  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent / "data"
-THETAS = [1.0, 1.1, 1.2, 1.3, 1.5, 1.8, 2.0]
+THETAS = [1.0, 1.05, 1.1, 1.2, 1.3, 1.5, 2.0]
+BET_TYPES = ["tan", "fuku", "nirentan", "nirenpuku", "wide", "sanrentan", "sanrenpuku"]
 
 
-def load(tag):
-    pr = pd.read_parquet(ROOT / f"pred_{tag}.parquet")
-    meta = json.loads((ROOT / f"model_{tag}.json").read_text())
-    con = sqlite3.connect(ROOT / "boatrace.sqlite")
-    od = pd.read_sql("SELECT * FROM odds", con)
-    return pr, meta, od, con
+def blend(pm, qm, a, b):
+    z = a * np.log(np.clip(pm, 1e-6, 1)) + b * np.log(np.clip(qm, 1e-6, 1))
+    z = z - z.max(1, keepdims=True)
+    e = np.exp(z)
+    return e / e.sum(1, keepdims=True)
 
 
-def market_win(pr, od):
-    t = od[od.bet_type == "tan"].assign(lane=lambda x: x.combo.astype(int))[["race_id", "lane", "odds"]]
-    m = pr.merge(t, on=["race_id", "lane"], how="inner")
-    m = m[m.groupby("race_id")["lane"].transform("count") == 6]
-    m["q_mkt"] = (1 / m["odds"]) / (1 / m["odds"]).groupby(m["race_id"]).transform("sum")
-    return m
+def odds_matrix(od, rids, bt, names):
+    o = od[od.bet_type == bt]
+    idx = {r: n for n, r in enumerate(rids)}
+    col = {c: k for k, c in enumerate(names)}
+    M = np.full((len(rids), len(names)), np.nan)
+    o = o[o.race_id.isin(idx) & o.combo.isin(col)]
+    M[o.race_id.map(idx).to_numpy(), o.combo.map(col).to_numpy()] = o.odds.to_numpy()
+    return M
 
 
-def blend(m, a, b):
-    z = a * np.log(np.clip(m["p_win"], 1e-6, 1)) + b * np.log(np.clip(m["q_mkt"], 1e-6, 1))
-    e = np.exp(z - z.groupby(m["race_id"]).transform("max"))
-    return e / e.groupby(m["race_id"]).transform("sum")
+def run_flat(back, choose, days):
+    return S.evaluate(back, choose, days)
 
 
-def fit_blend(tune):
-    win = tune["y_rank"] == 1
+def run_equal(back, choose, O, days, budget=1000):
+    """払戻を揃える配分。stake ∝ 1/odds、100円単位に丸め、合計 budget 円前後。"""
+    ok = ~np.isnan(back).any(1) & choose.any(1)
+    inv = np.zeros(len(back)); ret = np.zeros(len(back)); hit = np.zeros(len(back), bool)
+    for n in np.where(ok)[0]:
+        ks = np.where(choose[n])[0]
+        w = 1 / O[n, ks]
+        st = np.maximum(100, np.round(budget * w / w.sum() / 100) * 100)
+        inv[n] = st.sum()
+        r = back[n, ks] * st / 100
+        ret[n] = r.sum()
+        hit[n] = (back[n, ks] > 100).any()
+    if inv.sum() == 0:
+        return None
+    df = pd.DataFrame({"d": days[ok], "i": inv[ok], "r": ret[ok]}).groupby("d").sum()
+    rng = np.random.default_rng(0)
+    b = rng.integers(0, len(df), (500, len(df)))
+    boots = np.sort(df["r"].to_numpy()[b].sum(1) / df["i"].to_numpy()[b].sum(1))
+    return {"races": int(ok.sum()), "race_hit": float(hit[ok].mean()), "roi": float(ret.sum() / inv.sum()),
+            "ci_lo": float(boots[12]), "ci_hi": float(boots[487]), "invest": float(inv.sum())}
 
-    def nll(x):
-        return -np.log(np.clip(blend(tune, x[0], x[1])[win], 1e-9, 1)).mean()
 
-    r = minimize(nll, [1.0, 1.0], method="Nelder-Mead")
-    mk = -np.log(np.clip(tune["q_mkt"][win], 1e-9, 1)).mean()
-    md = -np.log(np.clip(tune["p_win"][win], 1e-9, 1)).mean()
-    return r.x, {"nll_market": mk, "nll_model": md, "nll_blend": r.fun}
-
-
-def candidates(m, lam, od, exacta=None):
-    """各レースの全舟券（単勝・2連単・2連複）について、混合確率と確定オッズを並べる。
-    exacta があれば 2着は 2着モデルの条件付き確率を使う（無ければ λ 付き Harville）。"""
-    o = {(r, bt, c): x for r, bt, c, x in od[["race_id", "bet_type", "combo", "odds"]].itertuples(index=False)}
-    cond = None
-    if exacta is not None:
-        cond = {(r, f, s): p for r, f, s, p in exacta[["race_id", "first", "second", "p2_given"]].itertuples(index=False)}
-    rows = []
-    for rid, g in m.groupby("race_id", sort=False):
-        g = g.sort_values("lane")
-        p = g["p_mix"].to_numpy()
-        per = g["period"].iloc[0]
-        for i in range(6):
-            rows.append((rid, per, "tan", str(i + 1), p[i], o.get((rid, "tan", str(i + 1)))))
-        q = p ** lam
-        ex = {}
-        for i, j in itertools.permutations(range(6), 2):
-            if cond is not None and (rid, i + 1, j + 1) in cond:
-                ex[(i, j)] = p[i] * cond[(rid, i + 1, j + 1)]
-            else:
-                ex[(i, j)] = p[i] * q[j] / (q.sum() - q[i])
-            c = f"{i + 1}-{j + 1}"
-            rows.append((rid, per, "nirentan", c, ex[(i, j)], o.get((rid, "nirentan", c))))
-        for i, j in itertools.combinations(range(6), 2):
-            c = f"{i + 1}-{j + 1}"
-            rows.append((rid, per, "nirenpuku", c, ex[(i, j)] + ex[(j, i)], o.get((rid, "nirenpuku", c))))
-    c = pd.DataFrame(rows, columns=["race_id", "period", "bet_type", "combo", "p", "odds"]).dropna()
-    c["ev"] = c["p"] * c["odds"]
-    return c
+def run_kelly(back, choose, P, O, order, bank0=100_000, frac=0.25, cap=0.02):
+    """時系列順に資金を動かす。同じレースの複数点は同時に賭ける（資金はレース開始時の値で計算）。"""
+    bank, peak, mdd = bank0, bank0, 0.0
+    curve = []
+    for n in order:
+        if np.isnan(back[n]).any() or not choose[n].any():
+            continue
+        ks = np.where(choose[n])[0]
+        p, o = P[n, ks], O[n, ks]
+        f = np.clip(frac * (p * o - 1) / np.maximum(o - 1, 1e-9), 0, cap)
+        st = np.floor(f * bank / 100) * 100
+        if st.sum() <= 0:
+            continue
+        bank += (back[n, ks] * st / 100).sum() - st.sum()
+        peak = max(peak, bank)
+        mdd = max(mdd, 1 - bank / peak)
+        curve.append(bank)
+        if bank < 100:
+            break
+    return {"final_bank": float(bank), "max_drawdown": float(mdd), "races": len(curve)}
 
 
 def main():
     tag = sys.argv[1] if len(sys.argv) > 1 else "base"
-    pr, meta, od, con = load(tag)
-    m = market_win(pr, od)
-    tune = m[m.period == "tune"]
-    (a, b), info = fit_blend(tune)
-    m["p_mix"] = blend(m, a, b)
-    print(f"[{tag}] オッズのあるレース: 調整 {tune.race_id.nunique():,} / 試験 {m[m.period=='test'].race_id.nunique():,}")
-    print(f"混合の重み モデル a={a:.2f} 市場 b={b:.2f}")
-    print("1着の対数損失（調整期間）: 市場 {nll_market:.4f} / モデル {nll_model:.4f} / 混合 {nll_blend:.4f}".format(**info))
+    rids, per, p1, P2, yr = S.build(tag)
+    con = sqlite3.connect(ROOT / "boatrace.sqlite")
+    od = pd.read_sql("SELECT * FROM odds", con)
+    tan = odds_matrix(od, rids, "tan", [str(i) for i in range(1, 7)])
+    has = ~np.isnan(tan).any(1)
+    rids, per, p1, P2, yr, tan = rids[has], per[has], p1[has], P2[has], yr[has], tan[has]
+    q = (1 / tan) / (1 / tan).sum(1, keepdims=True)
+    tune = per == "tune"
+    w = yr == 1
+    ok = w.sum(1) == 1
 
+    def nll(x):
+        pm = blend(p1[tune & ok], q[tune & ok], x[0], x[1])
+        return -np.log(pm[w[tune & ok]]).mean()
+
+    a, b = minimize(nll, [1.0, 1.0], method="Nelder-Mead").x
+    pmix = blend(p1, q, a, b)
+    print(f"[{tag}] オッズのあるレース: 調整 {tune.sum():,} / 試験 {(per == 'test').sum():,}")
+    print(f"1着の対数損失（調整）: 市場 {-np.log(q[tune & ok][w[tune & ok]]).mean():.4f} / "
+          f"モデル {-np.log(p1[tune & ok][w[tune & ok]]).mean():.4f} / 混合 {nll([a, b]):.4f}  (a={a:.2f}, b={b:.2f})")
+
+    lam3 = S.fit_lambda3(pmix, P2, yr, tune)
+    T = S.trifecta(pmix, P2, lam3)
+    allc = S.combos(T, pmix, P2)
     book = Book(con)
-    exf = ROOT / f"exacta_{tag}.parquet"
-    cand = candidates(m, meta["lambda"], od, pd.read_parquet(exf) if exf.exists() else None)
+    days = np.array([r[:8] for r in rids])
+    order = np.argsort(rids)
 
-    def run(df):
-        return evaluate(book, ((r, bt, c, 100) for r, bt, c in df[["race_id", "bet_type", "combo"]].itertuples(index=False)))
-
-    races_by = {p: sorted(m[m.period == p].race_id.unique()) for p in ("tune", "test")}
-    print("\n■ 基準（同じレース集合で、何も考えずに買った場合）")
-    for p in ("tune", "test"):
-        for name, bt, combo in [("単勝 1", "tan", "1"), ("2連複 1=2 (C0)", "nirenpuku", "1-2")]:
-            print(p, fmt(name, evaluate(book, ((r, bt, combo, 100) for r in races_by[p]))))
-
-    print("\n■ モデルだけで選ぶ（オッズを見ない）")
-    for p in ("tune", "test"):
-        cp = cand[cand.period == p]
-        for bt in ("tan", "nirenpuku"):
-            top = cp[cp.bet_type == bt].loc[lambda x: x.groupby("race_id")["p"].idxmax()]
-            print(p, fmt(f"{bt} 確率最大の1点", run(top)))
-
-    print("\n■ 期待値で選ぶ（調整期間で θ を選ぶ）")
-    grid = []
-    for bt in ("tan", "nirentan", "nirenpuku"):
+    rows = []
+    for bt in BET_TYPES:
+        names, P = allc[bt]
+        O = odds_matrix(od, rids, bt, names)
+        if np.isnan(O).all():
+            print(f"{bt}: オッズ未取得のため省略")
+            continue
+        back = S.settle_matrix(book, rids, names, bt)
+        EV = P * O
         for th in THETAS:
-            sel = cand[(cand.period == "tune") & (cand.bet_type == bt) & (cand.ev >= th)]
-            if len(sel) < 200:
-                continue
-            r = run(sel)
-            grid.append((bt, th, r))
-            print("tune", fmt(f"{bt} EV>={th}", r))
-    if not grid:
-        print("調整期間のデータが足りない")
-        return
-    # 選び方: 回収率の95%区間の下限が最も高いもの（偶然の当たりで選ばないため）
-    bt, th, r = max(grid, key=lambda g: g[2]["ci95"][0])
-    print(f"\n→ 採用: {bt} 期待値 >= {th}（調整期間の区間下限が最大）")
-    sel = cand[(cand.period == "test") & (cand.bet_type == bt) & (cand.ev >= th)]
-    if len(sel):
-        rt = run(sel)
-        print("test", fmt(f"{bt} EV>={th}", rt))
-        # 最大払戻を除いた回収率
-        pays = [book.settle(rr, b2, c, 100) for rr, b2, c in sel[["race_id", "bet_type", "combo"]].itertuples(index=False)]
-        print(f"     最大払戻 {max(pays):,}円を除くと 回収率 {(sum(pays) - max(pays)) / (100 * len(pays)) * 100:.1f}%")
+            ch = (EV >= th) & ~np.isnan(O)
+            for p in ("tune", "test"):
+                m = per == p
+                r = run_flat(back[m], ch[m], days[m])
+                if r and r["races"] >= 30:
+                    rows.append({"bet_type": bt, "theta": th, "stake": "flat", "period": p, **r})
+                r = run_equal(back[m], ch[m], O[m], days[m])
+                if r and r["races"] >= 30:
+                    rows.append({"bet_type": bt, "theta": th, "stake": "equal", "period": p, **r})
+                mo = order[np.isin(order, np.where(m)[0])]
+                k = run_kelly(back, ch, P, O, mo)
+                rows.append({"bet_type": bt, "theta": th, "stake": "kelly", "period": p, **k})
+        print(bt, "done", flush=True)
+    res = pd.DataFrame(rows)
+    res.to_csv(ROOT / f"bets_{tag}.csv", index=False)
+
+    tu = res[(res.period == "tune") & (res.stake != "kelly")].sort_values("ci_lo", ascending=False)
+    te = res[res.period == "test"].set_index(["bet_type", "theta", "stake"])
+    print("\n■ 調整期間の上位15（回収率95%区間の下限順）→ 試験期間")
+    print(f"{'券種':<11}{'EV≥':>5}{'配分':>6}{'R数':>6}{'的中':>7}{'回収率':>8}{'下限':>7} | {'試験R':>6}{'的中':>7}{'回収率':>8}{'下限':>7}")
+    for _, r in tu.head(15).iterrows():
+        k = (r.bet_type, r.theta, r.stake)
+        t = te.loc[k] if k in te.index else None
+        ts = f"{int(t.races):6d}{t.race_hit*100:6.1f}%{t.roi*100:7.1f}%{t.ci_lo*100:6.1f}%" if t is not None and not pd.isna(t.get("roi")) else ""
+        print(f"{r.bet_type:<11}{r.theta:5.2f}{r.stake:>6}{int(r.races):6d}{r.race_hit*100:6.1f}%{r.roi*100:7.1f}%{r.ci_lo*100:6.1f}% | {ts}")
+
+    print("\n■ 1/4ケリー（資金10万円から）調整期間の上位5 → 試験期間")
+    ke = res[(res.stake == "kelly")]
+    for _, r in ke[ke.period == "tune"].sort_values("final_bank", ascending=False).head(5).iterrows():
+        t = ke[(ke.period == "test") & (ke.bet_type == r.bet_type) & (ke.theta == r.theta)].iloc[0]
+        print(f"{r.bet_type:<11} EV≥{r.theta:.2f}  調整 {r.final_bank:>10,.0f}円 (最大DD {r.max_drawdown*100:.0f}%)"
+              f"  → 試験 {t.final_bank:>10,.0f}円 (最大DD {t.max_drawdown*100:.0f}%)")
 
 
 if __name__ == "__main__":

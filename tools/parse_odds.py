@@ -2,7 +2,7 @@
 使い方: python3 tools/parse_odds.py
 
 odds(race_id, bet_type, combo, odds)
-  bet_type: tan / fuku(odds=下限) / nirentan / nirenpuku
+  bet_type: tan / fuku(odds=下限) / nirentan / nirenpuku / sanrentan / sanrenpuku / wide(下限) / wide_hi(上限)
   欠場などで売れていない組み合わせは入れない
 """
 import gzip, pathlib, re, sqlite3, sys
@@ -45,6 +45,56 @@ def parse_2tf(html):
                 a, b = first, int(lab)
                 combo = f"{a}-{b}" if bt == "nirentan" else f"{min(a, b)}-{max(a, b)}"
                 out.append((bt, combo, o))
+    return out
+
+
+def parse_3(html, bt):
+    """3連単(odds3t)・3連複(odds3f)。列=1着(最小)艇。各列は 1行目が(2着, 3着, オッズ)、
+    同じ2着のあいだの続く行は(3着, オッズ)の2セル。3連複は使わない位置が is-disabled で埋まっている。"""
+    out = []
+    tbs = [t for t in tables(html) if "oddsPoint" in t]
+    if not tbs:
+        return out
+    second = [None] * 6
+    for cells in rows(tbs[0]):
+        width = 3 if len(cells) == 18 else 2 if len(cells) == 12 else None
+        if width is None:
+            continue
+        for c in range(6):
+            grp = cells[c * width:(c + 1) * width]
+            if width == 3:
+                second[c] = grp[0][1]
+                grp = grp[1:]
+            third, (cls, val) = grp[0][1], grp[1]
+            if "oddsPoint" not in cls or not (third.isdigit() and str(second[c]).isdigit()):
+                continue
+            o = odds_val(val)
+            if o is None:
+                continue
+            a, b, d = c + 1, int(second[c]), int(third)
+            combo = f"{a}-{b}-{d}" if bt == "sanrentan" else "-".join(map(str, sorted((a, b, d))))
+            out.append((bt, combo, o))
+    return out
+
+
+def parse_wide(html):
+    """拡連複(oddsk)。2連複と同じ三角表で、オッズは '下限-上限'。下限を odds、上限を別行(wide_hi)で持つ。"""
+    out = []
+    tbs = [t for t in tables(html) if "oddsPoint" in t]
+    if not tbs:
+        return out
+    for cells in rows(tbs[0]):
+        for k in range(0, len(cells) - 1, 2):
+            lab, (cls, val) = cells[k][1], cells[k + 1]
+            if not lab.isdigit() or "oddsPoint" not in cls:
+                continue
+            lo, _, hi = val.partition("-")
+            a, b = k // 2 + 1, int(lab)
+            combo = f"{min(a, b)}-{max(a, b)}"
+            if odds_val(lo) is not None:
+                out.append(("wide", combo, odds_val(lo)))
+            if odds_val(hi) is not None:
+                out.append(("wide_hi", combo, odds_val(hi)))
     return out
 
 
@@ -121,7 +171,9 @@ def main():
             con.executemany("INSERT INTO before VALUES(?,?,?,?,?,?,?,?,?,?)",
                             [(rid, *r) for r in parse_before(html)])
         else:
-            recs = parse_2tf(html) if page == "odds2tf" else parse_tf(html)
+            recs = {"odds2tf": parse_2tf, "oddstf": parse_tf, "oddsk": parse_wide,
+                    "odds3t": lambda h: parse_3(h, "sanrentan"),
+                    "odds3f": lambda h: parse_3(h, "sanrenpuku")}[page](html)
             con.executemany("INSERT INTO odds VALUES(?,?,?,?)", [(rid, *r) for r in recs])
         n += 1
     con.execute("CREATE INDEX IF NOT EXISTS ix_odds ON odds(race_id, bet_type)")

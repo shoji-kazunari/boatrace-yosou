@@ -1,5 +1,6 @@
 """boatrace.jp から過去レースの確定オッズ（単勝・複勝 / 2連単・2連複）と直前情報を取得し、HTMLのまま保存する。
-使い方: python3 tools/fetch_odds.py 2025-07-01 2026-11-22 6   # 6日おき
+使い方: python3 tools/fetch_odds.py 2025-07-01 2026-11-22 6 [ページ,…]   # 6日おき
+  ページ既定: oddstf,odds2tf,beforeinfo。3連単/3連複/拡連複は odds3t,odds3f,oddsk
 
 - 対象レースは成績ファイル(K)に載っているものだけ。Kが無ければ先に取る
 - 保存先: data/raw/web/<YYYYMMDD>/<場2桁><R2桁>_<page>.html.gz（取得済みは飛ばす）
@@ -58,12 +59,13 @@ def main():
     start = datetime.date.fromisoformat(sys.argv[1])
     end = datetime.date.fromisoformat(sys.argv[2])
     step = int(sys.argv[3]) if len(sys.argv) > 3 else 1
+    pages = tuple(sys.argv[4].split(",")) if len(sys.argv) > 4 else PAGES
     d = start
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
         while d <= end:
             rs = races_of(d)
             print(d, len(rs), "races", flush=True)
-            list(ex.map(lambda a: get(d, *a), [(v, r, p) for v, r in rs for p in PAGES]))
+            list(ex.map(lambda a: get(d, *a), [(v, r, p) for v, r in rs for p in pages]))
             d += datetime.timedelta(days=step)
 
 
