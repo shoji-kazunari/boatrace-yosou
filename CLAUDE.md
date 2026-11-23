@@ -20,6 +20,19 @@
 - 読み込み: `python3 tools/parse.py` → `data/boatrace.sqlite`
 - 基準の回収率: `python3 tools/backtest.py [開始YYYYMMDD 終了YYYYMMDD]`
 
+## 仕組み（tools/）
+
+| 段階 | スクリプト | 中身 |
+|---|---|---|
+| 取得 | download.py / fetch_odds.py | 成績・番組表（全日）／確定オッズ・直前情報（12日おきに間引き） |
+| 読込 | parse.py / parse_odds.py | SQLite: races, results, payouts, cards, odds, before |
+| 特徴量 | features.py [--course] | 前日までの履歴だけで作る。--course は展示進入で進入コースを決める |
+| モデル | model.py [--ex] [--course] | 1着モデル＋2着モデル（1着の条件付き）。LightGBM＋レース内ソフトマックス |
+| 効き目 | ablation.py | 特徴量グループを1つずつ外して調整期間の損失の悪化を見る |
+| 買い方 | bet.py | 混合確率（モデル^a×市場^b）×確定オッズの期待値で買う |
+
+期間: 助走 2023-01〜06 / 学習 2023-07〜2025-06 / 調整 2025-07〜12 / 試験 2026-01〜
+
 ## 検証で守ること（過去3ヶ月の反省から）
 
 1. **ルールを作る期間と、試す期間を必ず分ける。** 試す期間の結果を見てルールを直したら、

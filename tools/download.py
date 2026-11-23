@@ -7,7 +7,7 @@ import sys, time, datetime, pathlib, urllib.request, urllib.error
 BASE = "https://www1.mbrace.or.jp/od2"
 ROOT = pathlib.Path(__file__).resolve().parent.parent / "data" / "raw"
 WAIT = 0.7
-WORKERS = 4
+WORKERS = 8
 
 def fetch(kind, d):
     yymmdd = d.strftime("%y%m%d")
@@ -39,7 +39,7 @@ def main():
     start = datetime.date.fromisoformat(sys.argv[1])
     end = datetime.date.fromisoformat(sys.argv[2])
     days = [start + datetime.timedelta(days=i) for i in range((end - start).days + 1)]
-    # 1ファイル約10秒かかる（応答待ち）ため、同時4本までで取る
+    # 1ファイル約10秒かかる（応答待ち）ため、同時8本までで取る
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
         for d in days:
             for kind in ("K", "B"):
