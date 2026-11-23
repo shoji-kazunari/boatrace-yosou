@@ -94,8 +94,10 @@ def main():
     feats = M.BASE + ([] if "--nostyle" in args else M.STYLE) + ([] if "--noform" in args else M.FORM) \
         + (M.EX if use_ex else []) + (["plan_course", "course_changed"] if use_course else []) \
         + (M.DAY if "--day" in args else [])
+    if "--nowind" in args:  # 風・波（成績ファイルの値はレース時点＝締切後）を外して、混入の影響を確かめる
+        feats = [f for f in feats if f not in ("wind_speed", "wave", "wind_dir_c")]
     tag = "wf_" + ("ex" if use_ex else "base") + ("_nostyle" if "--nostyle" in args else "") \
-        + ("_noform" if "--noform" in args else "") + ("_course" if use_course else "") + ("_sm" if use_softmax else "") + ("_day" if "--day" in args else "") + ("_3" if "--third" in args else "")
+        + ("_noform" if "--noform" in args else "") + ("_course" if use_course else "") + ("_sm" if use_softmax else "") + ("_day" if "--day" in args else "") + ("_3" if "--third" in args else "") + ("_nowind" if "--nowind" in args else "")
     fname = args[args.index("--features") + 1] if "--features" in args else \
         ("features_course.parquet" if use_course else "features.parquet")
     df = pd.read_parquet(ROOT / fname)

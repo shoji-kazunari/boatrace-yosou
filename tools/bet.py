@@ -46,6 +46,7 @@ def odds_matrix(od, rids, bt, names):
     M = np.full((len(rids), len(names)), np.nan)
     o = o[o.race_id.isin(idx) & o.combo.isin(col)]
     M[o.race_id.map(idx).to_numpy(), o.combo.map(col).to_numpy()] = o.odds.to_numpy()
+    M[M <= 0] = np.nan
     return M
 
 
@@ -118,7 +119,9 @@ def main():
     con = sqlite3.connect(ROOT / "boatrace.sqlite")
     od = pd.read_sql("SELECT * FROM odds", con)
     tan = odds_matrix(od, rids, "tan", [str(i) for i in range(1, 7)])
-    has = ~np.isnan(tan).any(1)
+    tan[tan <= 0] = np.nan              # 0.0 は欠場などで売れていない艇
+    has = (~np.isnan(tan)).sum(1) >= 5  # 欠場1艇までは使う
+    tan = np.where(np.isnan(tan), 1e4, tan)  # 売れていない艇は市場確率ほぼ0
     rids, per, p1, P2, yr, tan = rids[has], per[has], p1[has], P2[has], yr[has], tan[has]
     q = (1 / tan) / (1 / tan).sum(1, keepdims=True)
     tune = per == "tune"
