@@ -1,5 +1,8 @@
 """モデル確率とオッズを比べて、期待値ベースの買い方を全券種・賭け金の配分ごとに評価する。
-使い方: python3 tools/bet.py [tag]      # tag は model.py の出力名（既定 base）
+使い方: python3 tools/bet.py [tag] [--split dev|final]
+  tag は model.py / walkforward.py の出力名（既定 base）
+  --split dev   : ウォークフォワード予想を 調整2025-07〜09 / 試験2025-10〜12 で評価（封印前）
+  --split final : 調整2025-07〜12 / 試験2026-（封印期間。walkforward.py --final の予想が必要。最後に1回だけ）
 
 手順（設定はすべて調整期間だけで決め、試験期間は最後に1回だけ見る）:
   1. 市場の確率 = 単勝オッズの逆数をレース内で正規化
@@ -96,7 +99,21 @@ def run_kelly(back, choose, P, O, order, bank0=100_000, frac=0.25, cap=0.02):
 
 def main():
     tag = sys.argv[1] if len(sys.argv) > 1 else "base"
+    split = sys.argv[sys.argv.index("--split") + 1] if "--split" in sys.argv else None
     rids, per, p1, P2, yr = S.build(tag)
+    if split:
+        # ウォークフォワードの予想を、オッズのある期間で区切り直す
+        #   dev  : 調整 2025-07〜09 / 試験 2025-10〜12（封印前。何度使ってもよい）
+        #   final: 調整 2025-07〜12 / 試験 2026-01〜（封印期間。最後に1回だけ）
+        d = np.array([r[:8] for r in rids])
+        if split == "dev":
+            per = np.where((d >= "20250701") & (d <= "20250930"), "tune",
+                           np.where((d >= "20251001") & (d <= "20251231"), "test", "x"))
+        else:
+            per = np.where((d >= "20250701") & (d <= "20251231"), "tune", np.where(d >= "20260101", "test", "x"))
+        keep = per != "x"
+        rids, per, p1, P2, yr = rids[keep], per[keep], p1[keep], P2[keep], yr[keep]
+        tag = f"{tag}_{split}"
     con = sqlite3.connect(ROOT / "boatrace.sqlite")
     od = pd.read_sql("SELECT * FROM odds", con)
     tan = odds_matrix(od, rids, "tan", [str(i) for i in range(1, 7)])
@@ -149,6 +166,9 @@ def main():
         print(bt, "done", flush=True)
     res = pd.DataFrame(rows)
     res.to_csv(ROOT / f"bets_{tag}.csv", index=False)
+    if res.empty:
+        print("評価できる組み合わせなし")
+        return
 
     tu = res[(res.period == "tune") & (res.stake != "kelly")].sort_values("ci_lo", ascending=False)
     te = res[res.period == "test"].set_index(["bet_type", "theta", "stake"])
