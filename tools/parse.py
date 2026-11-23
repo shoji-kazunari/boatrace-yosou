@@ -110,7 +110,8 @@ def parse_k(date, data, cur):
                 course = num(rest[3], int) if len(rest) > 3 else None
                 st_raw = rest[4] if len(rest) > 4 else None
                 st = num(st_raw.lstrip("FL")) if st_raw else None
-                rank = int(rank_raw) if rank_raw.isdigit() else None
+                # "00" が24件ほどある（意味不明の記録）。着順なしとして扱う
+                rank = int(rank_raw) if rank_raw.isdigit() and int(rank_raw) >= 1 else None
                 cur.execute("INSERT OR REPLACE INTO results VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                             (race_id, lane, rank_raw, rank, toban, motor, boat, exhibit, course, st, st_raw))
                 i += 1

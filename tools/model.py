@@ -37,6 +37,8 @@ STYLE = ["st_makuri", "st_sashi", "st_mz", "st_nuki", "st_nige", "st_attack", "s
 FORM = ["h90_start", "h90_avg_rank", "form_delta", "f_hold", "ha_st_sd", "mo_start", "mo_top2_r", "mo_delta",
         "wind_dir_c", "mo_top2_r_rel", "mo_top2_r_rk", "h90_avg_rank_rel", "h90_avg_rank_rk",
         "ha_st_sd_rel", "ha_st_sd_rk"]
+# 当日の前走・休み明け（features.py で追加。--day で使う）
+DAY = ["day_prev_rank", "day_prev_st", "day_n_before", "rest_days"]
 EX = ["exhibit", "exhibit_rel", "exhibit_rk", "ex_min_gap"]
 
 

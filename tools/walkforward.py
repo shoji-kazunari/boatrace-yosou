@@ -1,6 +1,7 @@
 """ウォークフォワード検証: 『その時点までのデータだけで作ったモデル』で次の期間を予想し、答え合わせする。
 使い方: python3 tools/walkforward.py [--course] [--ex] [--nostyle] [--noform] [--softmax] [--step 3] [--final]
   --softmax  1着モデルを「6艇のうちどれが勝つか」のレース単位の多項ロジットで直接学習する
+  --leaves N --minleaf N --lr x --ff x --l2 x   学習の設定（既定 63 / 200 / 0.05 / 0.8 / 1.0）
 
   開発用の予想期間  2024-07 〜 2025-12   … 試行錯誤はここの成績だけを見て行う
   封印期間          2026-01 〜           … --final を付けたときだけ予想する。最後に1回だけ
@@ -72,15 +73,24 @@ def main():
     use_course, use_ex = "--course" in args, "--ex" in args
     use_softmax = "--softmax" in args
     feats = M.BASE + ([] if "--nostyle" in args else M.STYLE) + ([] if "--noform" in args else M.FORM) \
-        + (M.EX if use_ex else []) + (["plan_course", "course_changed"] if use_course else [])
+        + (M.EX if use_ex else []) + (["plan_course", "course_changed"] if use_course else []) \
+        + (M.DAY if "--day" in args else [])
     tag = "wf_" + ("ex" if use_ex else "base") + ("_nostyle" if "--nostyle" in args else "") \
-        + ("_noform" if "--noform" in args else "") + ("_course" if use_course else "") + ("_sm" if use_softmax else "")
-    df = pd.read_parquet(ROOT / ("features_course.parquet" if use_course else "features.parquet"))
+        + ("_noform" if "--noform" in args else "") + ("_course" if use_course else "") + ("_sm" if use_softmax else "") + ("_day" if "--day" in args else "")
+    fname = args[args.index("--features") + 1] if "--features" in args else \
+        ("features_course.parquet" if use_course else "features.parquet")
+    df = pd.read_parquet(ROOT / fname)
     df["date"] = df["date"].dt.strftime("%Y-%m-%d")
     df = df[df.groupby("race_id")["lane"].transform("count") == 6].sort_values(["race_id", "lane"])
 
-    params = dict(objective="binary", learning_rate=0.05, num_leaves=63, min_data_in_leaf=200,
-                  feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0, verbose=-1, seed=1)
+    def opt(name, default, cast=float):
+        return cast(args[args.index(name) + 1]) if name in args else default
+    leaves, minleaf, lr = opt("--leaves", 63, int), opt("--minleaf", 200, int), opt("--lr", 0.05)
+    ff, l2 = opt("--ff", 0.8), opt("--l2", 1.0)
+    if (leaves, minleaf, lr, ff, l2) != (63, 200, 0.05, 0.8, 1.0):
+        tag += f"_L{leaves}_m{minleaf}_lr{lr}_ff{ff}_l2{l2}"
+    params = dict(objective="binary", learning_rate=lr, num_leaves=leaves, min_data_in_leaf=minleaf,
+                  feature_fraction=ff, bagging_fraction=0.8, bagging_freq=1, lambda_l2=l2, verbose=-1, seed=1)
     cats = [c for c in ("venue", "race_class_c", "wind_dir_c") if c in feats]
     spans = list(months(*DEV, step)) + (list(months(*FINAL, step)) if "--final" in args else [])
     preds, exs = [], []

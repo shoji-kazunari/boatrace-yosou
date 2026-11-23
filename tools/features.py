@@ -15,6 +15,8 @@ import pandas as pd
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent / "data"
 USE_COURSE = "--course" in sys.argv
+OUT = sys.argv[sys.argv.index("--out") + 1] if "--out" in sys.argv else \
+    ("features_course.parquet" if USE_COURSE else "features.parquet")
 GRADE = {"A1": 4, "A2": 3, "B1": 2, "B2": 1}
 
 
@@ -133,6 +135,24 @@ def main():
         df["ex_known"] = 0
     df["course_changed"] = (df["plan_course"] != df["lane"]).astype(int)
 
+    # 当日の前走（同じ日・同じ場で、このレースより前のRに出ていればその着順とST）。締切前に確定している情報
+    day = df[["race_id", "lane", "toban", "date", "venue", "rno", "rank"]].merge(
+        res[["race_id", "lane", "st"]], on=["race_id", "lane"], how="left")
+    day = day.sort_values(["toban", "date", "rno"])
+    gd = day.groupby(["toban", "date"])
+    day["day_prev_rank"] = gd["rank"].shift(1).fillna(6.5).where(gd.cumcount() > 0)
+    day["day_prev_st"] = gd["st"].shift(1).where(gd.cumcount() > 0)
+    day["day_n_before"] = gd.cumcount()
+    df = df.merge(day[["toban", "date", "rno", "day_prev_rank", "day_prev_st", "day_n_before"]],
+                  on=["toban", "date", "rno"], how="left")
+    # 休み明け: 前回の出走日からの日数（前日までの出走だけを見る）
+    last = res[["race_id", "toban"]].merge(races[["race_id", "date"]], on="race_id")
+    last = last.assign(date=pd.to_datetime(last["date"])).drop_duplicates(["toban", "date"])[["toban", "date"]]
+    last["last_date"] = last["date"]
+    df = asof_prev(df, last, ["toban"], "x_")
+    df["rest_days"] = ((df["date"] - df["x_last_date"]).dt.days - 1).clip(upper=120)
+    df = df.drop(columns=["x_last_date"])
+
     c, a, v, mo = history_feats(res, races)
     c = c.rename(columns={"course": "plan_course"})
     df = df.reset_index(drop=True)
@@ -209,7 +229,7 @@ def main():
     df["race_class_c"] = df["race_class"].astype("category")
     df = df.sort_values(["date", "race_id", "lane"]).reset_index(drop=True)
     df.drop(columns=["name", "branch", "series", "early", "rank_raw", "kimarite", "deadline",
-                     "race_class", "weather", "wind_dir"], errors="ignore").to_parquet(ROOT / ("features_course.parquet" if USE_COURSE else "features.parquet"))
+                     "race_class", "weather", "wind_dir"], errors="ignore").to_parquet(ROOT / OUT)
     print(df.shape, df["date"].min().date(), df["date"].max().date())
 
 
