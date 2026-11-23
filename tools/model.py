@@ -28,6 +28,11 @@ BASE = ["lane", "venue", "rno", "distance", "race_class_c", "wind_speed", "wave"
         "ha_avg_st", "ha_fly"]
 BASE += [f"{k}_{s}" for k in ["nat_win", "loc_win", "motor_2", "boat_2", "grade_n", "hc_win_r",
                               "hc_top2_r", "ha_avg_st", "ha_avg_rank", "age", "weight"] for s in ("rel", "rk")]
+# 選手の戦い方・レース場との相性・隣の艇との関係（STYLE を外したモデルと比べて効果を測る）
+STYLE = ["st_makuri", "st_sashi", "st_mz", "st_nuki", "st_nige", "st_attack", "st_wait",
+         "hv_start", "hv_win_r", "hv_top2_r", "hv_gain",
+         "in_st", "st_adv_in", "in_nige", "out_attack", "out_st_adv", "r_lane1_nige", "r_lane1_st",
+         "attack_x_adv", "hv_win_r_rel", "hv_win_r_rk", "st_attack_rel", "st_attack_rk"]
 EX = ["exhibit", "exhibit_rel", "exhibit_rk", "ex_min_gap"]
 
 
@@ -94,8 +99,9 @@ def fit_lambda(df, pcol):
 
 def main():
     use_ex = "--ex" in sys.argv
-    feats = BASE + (EX if use_ex else [])
-    tag = "ex" if use_ex else "base"
+    no_style = "--nostyle" in sys.argv
+    feats = BASE + ([] if no_style else STYLE) + (EX if use_ex else [])
+    tag = ("ex" if use_ex else "base") + ("_nostyle" if no_style else "")
     df = pd.read_parquet(ROOT / "features.parquet")
     df["date"] = df["date"].dt.strftime("%Y-%m-%d")
     df = df[df.groupby("race_id")["lane"].transform("count") == 6]

@@ -10,7 +10,7 @@ python3 tools/backtest.py                         # 基準となる買い方の�
 python3 tools/fetch_odds.py 2025-07-01 2026-11-22 12  # 確定オッズ（12日おき）
 python3 tools/parse_odds.py                       # オッズをDBへ
 python3 tools/features.py                         # 特徴量（前日までの情報だけ）
-python3 tools/model.py [--ex]                     # 1着確率モデル（--ex: 展示タイムも使う）
+python3 tools/model.py [--ex] [--nostyle]         # 1着確率モデル（--ex: 展示も使う / --nostyle: 戦い方・場相性を外す）
 python3 tools/bet.py [base|ex]                    # オッズと比べた買い方の評価
 ```
 

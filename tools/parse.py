@@ -87,6 +87,8 @@ def parse_k(date, data, cur):
             race_id = f"{date}-{venue:02d}-{rno:02d}"
             hdr = lines[i + 1].decode("cp932", "replace")
             kimarite = hdr.split()[-1].replace("　", "") if "ﾚｰｽﾀｲﾑ" in hdr else None
+            if kimarite == "ﾚｰｽﾀｲﾑ":  # 決まり手欄が空（不成立など）
+                kimarite = None
             cur.execute("INSERT OR REPLACE INTO races(race_id,date,venue,rno,race_class,distance,weather,"
                         "wind_dir,wind_speed,wave,kimarite) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                         (race_id, date, venue, rno, m.group(2).replace("　", ""), int(m.group(3)),
