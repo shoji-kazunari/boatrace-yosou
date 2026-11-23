@@ -192,6 +192,9 @@ def main():
     df = df[df.groupby("race_id")["lane"].transform("count") == 6]
 
     tr, tu, te = period(df, TRAIN), period(df, TUNE), period(df, TEST)
+    if use_course:
+        # 評価に使うのは本物の展示進入があるレースだけ（本番進入の代用はレース後の情報なので混ぜない）
+        tu, te = tu[tu.ex_known == 1], te[te.ex_known == 1]
     print(f"[{tag}] 学習 {tr.race_id.nunique():,} / 調整 {tu.race_id.nunique():,} / 試験 {te.race_id.nunique():,} レース")
 
     params = dict(objective="binary", learning_rate=0.03, num_leaves=63, min_data_in_leaf=200,

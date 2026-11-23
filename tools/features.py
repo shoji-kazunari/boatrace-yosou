@@ -124,10 +124,13 @@ def main():
             df = df.merge(bf, on=["race_id", "lane"], how="left")
             has = df.groupby("race_id")["ex_course"].transform("count") == 6
             df.loc[has, "plan_course"] = df.loc[has, "ex_course"].astype(int)
+            df["ex_known"] = has.astype(int)  # 1 = 本物の展示進入。0 = 本番進入で代用（評価に使ってはいけない）
             df = df.drop(columns="ex_course")
             print("展示進入を使ったレース", int(has.sum() / 6))
         except Exception as e:  # before テーブルがまだ無い
             print("展示進入なし:", e)
+    if "ex_known" not in df:
+        df["ex_known"] = 0
     df["course_changed"] = (df["plan_course"] != df["lane"]).astype(int)
 
     c, a, v, mo = history_feats(res, races)

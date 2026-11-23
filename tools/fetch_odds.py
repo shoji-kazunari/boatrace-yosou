@@ -4,7 +4,7 @@
 
 - 対象レースは成績ファイル(K)に載っているものだけ。Kが無ければ先に取る
 - 保存先: data/raw/web/<YYYYMMDD>/<場2桁><R2桁>_<page>.html.gz（取得済みは飛ばす）
-- 1ページ約8.5秒（ほぼ応答待ち）なので同時8本で取る
+- 1ページ約8.5秒（ほぼ応答待ち）なので同時12本で取る
 
 注意: ここで取れるのは「確定オッズ」で、締切前に見えるオッズとは少し違う。
 締切直前の売上の流入で動くため、確定オッズでの検証は実戦より少し甘く出る可能性がある。
@@ -17,7 +17,7 @@ import download, parse  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent / "data" / "raw"
 PAGES = ("oddstf", "odds2tf", "beforeinfo")  # beforeinfo = 直前情報（展示進入・展示ST・チルト・部品交換）
-WORKERS = 8
+WORKERS = 12
 
 
 def races_of(d):
