@@ -180,7 +180,9 @@ def main():
         row["final_nll_win"] = M.race_nll(fin, fin.p_win)
         row["final_nll_exacta"] = M.exacta_nll(ex[ex.period == "final"], fin)
     log = ROOT / "wf_log.csv"
-    pd.DataFrame([row]).to_csv(log, mode="a", header=not log.exists(), index=False)
+    # 試行ごとに列が増えることがあるので、毎回読み直して全体を書き直す
+    prev = pd.read_csv(log) if log.exists() else pd.DataFrame()
+    pd.concat([prev, pd.DataFrame([row])], ignore_index=True).to_csv(log, index=False)
     print(json.dumps(row, ensure_ascii=False, indent=1))
 
 
