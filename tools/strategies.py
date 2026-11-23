@@ -1,5 +1,6 @@
 """オッズを使わない買い方（券種・点数・組み方・レース選び）を、確定払戻で総当たりに比べる。
-使い方: python3 tools/strategies.py [tag]     # tag は model.py の出力名（既定 base）
+使い方: python3 tools/strategies.py [tag] [--final]   # tag は model.py / walkforward.py の出力名
+  --final  開発期間全体で選び、封印期間（2026〜）で1回だけ確かめる
 
 確率の組み立て（model.py の出力を使う）:
   1着   p1(i)          = 1着モデル
@@ -172,9 +173,16 @@ def strategies(names, P, tune):
 def main():
     tag = sys.argv[1] if len(sys.argv) > 1 else "base"
     rids, per, p1, P2, yr = build(tag)
+    if "--final" in sys.argv:
+        # 封印期間の確認: 開発期間全体（tune+test）で選び、封印期間（final）で1回だけ確かめる
+        per = np.where(per == "final", "test", "tune")
+        tag = tag + "_final"
+    else:
+        keep = per != "final"
+        rids, per, p1, P2, yr = rids[keep], per[keep], p1[keep], P2[keep], yr[keep]
     tune = per == "tune"
     lam3 = fit_lambda3(p1, P2, yr, tune)
-    T = trifecta(p1, P2, lam3, load_p3(tag, rids))
+    T = trifecta(p1, P2, lam3, load_p3(tag.replace("_final", ""), rids))
     print(f"[{tag}] レース 調整 {tune.sum():,} / 試験 {(per == 'test').sum():,}   3着λ3={lam3:.3f}")
     book = Book(sqlite3.connect(ROOT / "boatrace.sqlite"))
     days = np.array([r[:8] for r in rids])
