@@ -59,14 +59,31 @@ def fit_lambda3(p1, P2, yr, mask):
     return float(r.x)
 
 
-def trifecta(p1, P2, lam3):
+def trifecta(p1, P2, lam3, P3=None):
+    """P3: R×6×6×6 の3着条件付き確率（3着モデル。無い組は NaN）。NaN の組は λ3 近似で埋める。"""
     R = len(p1)
     q = p1 ** lam3
     T = np.zeros((R, 6, 6, 6))
     for i, j, k in PERMS3:
         rest = q.sum(1) - q[:, i] - q[:, j]
-        T[:, i, j, k] = p1[:, i] * P2[:, i, j] * q[:, k] / rest
+        c = q[:, k] / rest
+        if P3 is not None:
+            c = np.where(np.isnan(P3[:, i, j, k]), c, P3[:, i, j, k])
+        T[:, i, j, k] = p1[:, i] * P2[:, i, j] * c
     return T
+
+
+def load_p3(tag, rids):
+    f = ROOT / f"trifecta_{tag}.parquet"
+    if not f.exists():
+        return None
+    t = pd.read_parquet(f)
+    idx = {r: n for n, r in enumerate(rids)}
+    t = t[t.race_id.isin(idx)]
+    P3 = np.full((len(rids), 6, 6, 6), np.nan)
+    P3[t.race_id.map(idx).to_numpy(), t["first"].to_numpy() - 1, t["second"].to_numpy() - 1,
+       t["third"].to_numpy() - 1] = t["p3_given"].to_numpy()
+    return P3
 
 
 def combos(T, p1, P2):
@@ -157,7 +174,7 @@ def main():
     rids, per, p1, P2, yr = build(tag)
     tune = per == "tune"
     lam3 = fit_lambda3(p1, P2, yr, tune)
-    T = trifecta(p1, P2, lam3)
+    T = trifecta(p1, P2, lam3, load_p3(tag, rids))
     print(f"[{tag}] レース 調整 {tune.sum():,} / 試験 {(per == 'test').sum():,}   3着λ3={lam3:.3f}")
     book = Book(sqlite3.connect(ROOT / "boatrace.sqlite"))
     days = np.array([r[:8] for r in rids])

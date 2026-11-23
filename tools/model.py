@@ -144,6 +144,65 @@ def train_second(tr, tu, feats, params):
     return m2, f2, float(t2.x), nll2
 
 
+T_EXTRA = ["w_" + k for k in W_FEATS] + ["v_" + k for k in W_FEATS] + ["rel_w", "rel_v", "between"]
+
+
+def third_rows(part, feats, pairs):
+    """『1着 i・2着 j だったら』という仮定で、残り4艇の3着用の行を作る。pairs: DataFrame(race_id, w_lane, v_lane)。"""
+    extra = [c for c in ("p_win",) if c in part.columns and c not in feats]
+    base = part[["race_id", "lane", "y_rank"] + extra + [f for f in feats if f not in ("lane",)]]
+    w = part[["race_id"] + W_FEATS].rename(columns={k: "w_" + k for k in W_FEATS})
+    v = part[["race_id"] + W_FEATS].rename(columns={k: "v_" + k for k in W_FEATS})
+    x = pairs.merge(w, on=["race_id", "w_lane"]).merge(v, on=["race_id", "v_lane"]).merge(base, on="race_id")
+    x = x[(x["lane"] != x["w_lane"]) & (x["lane"] != x["v_lane"])].copy()
+    x["rel_w"] = x["lane"] - x["w_lane"]
+    x["rel_v"] = x["lane"] - x["v_lane"]
+    x["between"] = ((x["lane"] - x["w_lane"]) * (x["lane"] - x["v_lane"]) < 0).astype(int)  # 1・2着艇の間の枠
+    x["key"] = x["race_id"] + "_" + x["w_lane"].astype(str) + x["v_lane"].astype(str)
+    return x
+
+
+def train_third(tr, va, feats, params):
+    """3着モデル: 実際の1・2着艇を除いた4艇のうち、どれが3着かを学習する。"""
+    def actual(part):
+        g = part[part.y_rank.isin([1, 2])].groupby("race_id")
+        ok = g["y_rank"].agg(lambda s: sorted(s.tolist()) == [1, 2])
+        ok = ok[ok].index
+        p = part[part.race_id.isin(ok)]
+        f = p[p.y_rank == 1].set_index("race_id")["lane"]
+        s = p[p.y_rank == 2].set_index("race_id")["lane"]
+        pairs = pd.DataFrame({"race_id": f.index, "w_lane": f.values, "v_lane": s.reindex(f.index).values})
+        return third_rows(p, feats, pairs)
+
+    xtr, xva = actual(tr), actual(va)
+    f3 = feats + T_EXTRA
+    cats = [c for c in ("venue", "race_class_c", "wind_dir_c") if c in f3]
+    d1 = lgb.Dataset(xtr[f3], (xtr.y_rank == 3).astype(int), categorical_feature=cats)
+    d2 = lgb.Dataset(xva[f3], (xva.y_rank == 3).astype(int), reference=d1)
+    m3 = lgb.train(params, d1, 3000, valid_sets=[d2], callbacks=[lgb.early_stopping(100, verbose=False)])
+    s = pd.Series(m3.predict(xva[f3], num_iteration=m3.best_iteration, raw_score=True), index=xva.index)
+    xva = xva.assign(s=s, race_id=xva.key)
+    t3 = minimize_scalar(lambda t: -np.log(np.clip(race_softmax(xva, xva["s"], t)[xva.y_rank == 3], 1e-9, 1)).mean(),
+                         bounds=(0.3, 3), method="bounded")
+    return m3, f3, float(t3.x), float(t3.fun)
+
+
+def trifecta_table(part, ex, m3, f3, t3, topk=10):
+    """2連単確率の上位 topk 組についてだけ、3着の条件付き確率 p3(k|i,j) を3着モデルで出す。
+    残りの組は strategies.py 側で λ3 近似を使う。"""
+    top = ex.sort_values(["race_id", "p_exacta"], ascending=[True, False]).groupby("race_id").head(topk)
+    pairs = top.rename(columns={"first": "w_lane", "second": "v_lane"})[["race_id", "w_lane", "v_lane"]]
+    out = []
+    for chunk in np.array_split(pairs.race_id.unique(), max(1, len(pairs) // 200_000)):
+        x = third_rows(part[part.race_id.isin(chunk)], [f for f in f3 if f not in T_EXTRA],
+                       pairs[pairs.race_id.isin(chunk)])
+        x["s"] = m3.predict(x[f3], num_iteration=m3.best_iteration, raw_score=True)
+        x["p3"] = race_softmax(x.assign(race_id=x.key), x["s"], t3).to_numpy()
+        out.append(pd.DataFrame({"race_id": x.race_id, "first": x.w_lane, "second": x.v_lane,
+                                 "third": x.lane, "p3_given": x.p3}))
+    return pd.concat(out)
+
+
 def exacta_table(pr, part, m2, f2, t2):
     """全30通りの2連単確率 = 1着確率 × 2着条件付き確率。"""
     winners = {r: list(range(1, 7)) for r in part.race_id.unique()}

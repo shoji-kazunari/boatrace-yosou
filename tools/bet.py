@@ -100,6 +100,7 @@ def run_kelly(back, choose, P, O, order, bank0=100_000, frac=0.25, cap=0.02):
 def main():
     tag = sys.argv[1] if len(sys.argv) > 1 else "base"
     split = sys.argv[sys.argv.index("--split") + 1] if "--split" in sys.argv else None
+    base_tag = tag
     rids, per, p1, P2, yr = S.build(tag)
     if split:
         # ウォークフォワードの予想を、オッズのある期間で区切り直す
@@ -135,7 +136,7 @@ def main():
           f"モデル {-np.log(p1[tune & ok][w[tune & ok]]).mean():.4f} / 混合 {nll([a, b]):.4f}  (a={a:.2f}, b={b:.2f})")
 
     lam3 = S.fit_lambda3(pmix, P2, yr, tune)
-    T = S.trifecta(pmix, P2, lam3)
+    T = S.trifecta(pmix, P2, lam3, S.load_p3(base_tag, rids))
     allc = S.combos(T, pmix, P2)
     book = Book(con)
     days = np.array([r[:8] for r in rids])
