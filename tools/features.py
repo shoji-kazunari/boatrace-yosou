@@ -1,6 +1,8 @@
 """1艇1行の特徴量テーブルを作る（data/features.parquet）。
 使い方: python3 tools/features.py [--course]
   --course  展示進入（直前情報）で進入コースを決める版を data/features_course.parquet に作る
+  --keep-open YYYYMMDD  その日以降は結果の無い行（当日の番組表）も残す（live.py 用）
+  --out NAME  出力ファイル名
 
 未来の情報を混ぜないための約束:
   - 選手の過去成績（コース別・ST・着順）は「そのレース日の前日まで」のレースだけで集計する
@@ -15,6 +17,7 @@ import pandas as pd
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent / "data"
 USE_COURSE = "--course" in sys.argv
+KEEP_OPEN = sys.argv[sys.argv.index("--keep-open") + 1] if "--keep-open" in sys.argv else None  # YYYYMMDD
 OUT = sys.argv[sys.argv.index("--out") + 1] if "--out" in sys.argv else \
     ("features_course.parquet" if USE_COURSE else "features.parquet")
 GRADE = {"A1": 4, "A2": 3, "B1": 2, "B2": 1}
@@ -104,11 +107,16 @@ def asof_window(left, right, by, prefix, days):
 def main():
     con = sqlite3.connect(ROOT / "boatrace.sqlite")
     races, cards, res = load(con)
-    races = races[races["race_id"].isin(res["race_id"].unique())]
+    if not KEEP_OPEN:
+        races = races[races["race_id"].isin(res["race_id"].unique())]
 
     df = cards.merge(races, on="race_id").merge(
         res[["race_id", "lane", "rank_raw", "rank", "exhibit", "course"]], on=["race_id", "lane"], how="left")
-    df = df[df["rank_raw"].notna()]
+    if KEEP_OPEN:  # 予想用: この日付以降は結果が無くても残す（当日の番組表だけの行）
+        df = df[df["rank_raw"].notna() | (df["date"] >= KEEP_OPEN)]
+        df["rank_raw"] = df["rank_raw"].fillna("")
+    else:
+        df = df[df["rank_raw"].notna()]
     df["date"] = pd.to_datetime(df["date"])
     df["grade_n"] = df["grade"].map(GRADE)
     ss = df["series"].map(series_stats)
