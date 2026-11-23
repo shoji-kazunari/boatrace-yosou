@@ -5,7 +5,7 @@
   1. 市場の確率 = 単勝オッズの逆数をレース内で正規化
   2. 混合確率 ∝ モデル^a × 市場^b   … a, b は調整期間の1着の対数尤度で決める
      （モデル単独より、市場の情報と組み合わせた方が確率として正確になる）
-  3. 2連単・2連複は 1着確率から λ 付きで組み立てる（model.py と同じ）
+  3. 2連単・2連複 = 混合1着確率 × 2着モデルの条件付き確率（model.py の exacta_*.parquet）
   4. 期待値 = 混合確率 × 確定オッズ。期待値 >= θ の舟券を100円ずつ買う
      θ と券種は調整期間の回収率で選ぶ
 
@@ -57,9 +57,13 @@ def fit_blend(tune):
     return r.x, {"nll_market": mk, "nll_model": md, "nll_blend": r.fun}
 
 
-def candidates(m, lam, od):
-    """各レースの全舟券（単勝・2連単・2連複）について、混合確率と確定オッズを並べる。"""
+def candidates(m, lam, od, exacta=None):
+    """各レースの全舟券（単勝・2連単・2連複）について、混合確率と確定オッズを並べる。
+    exacta があれば 2着は 2着モデルの条件付き確率を使う（無ければ λ 付き Harville）。"""
     o = {(r, bt, c): x for r, bt, c, x in od[["race_id", "bet_type", "combo", "odds"]].itertuples(index=False)}
+    cond = None
+    if exacta is not None:
+        cond = {(r, f, s): p for r, f, s, p in exacta[["race_id", "first", "second", "p2_given"]].itertuples(index=False)}
     rows = []
     for rid, g in m.groupby("race_id", sort=False):
         g = g.sort_values("lane")
@@ -70,7 +74,10 @@ def candidates(m, lam, od):
         q = p ** lam
         ex = {}
         for i, j in itertools.permutations(range(6), 2):
-            ex[(i, j)] = p[i] * q[j] / (q.sum() - q[i])
+            if cond is not None and (rid, i + 1, j + 1) in cond:
+                ex[(i, j)] = p[i] * cond[(rid, i + 1, j + 1)]
+            else:
+                ex[(i, j)] = p[i] * q[j] / (q.sum() - q[i])
             c = f"{i + 1}-{j + 1}"
             rows.append((rid, per, "nirentan", c, ex[(i, j)], o.get((rid, "nirentan", c))))
         for i, j in itertools.combinations(range(6), 2):
@@ -93,7 +100,8 @@ def main():
     print("1着の対数損失（調整期間）: 市場 {nll_market:.4f} / モデル {nll_model:.4f} / 混合 {nll_blend:.4f}".format(**info))
 
     book = Book(con)
-    cand = candidates(m, meta["lambda"], od)
+    exf = ROOT / f"exacta_{tag}.parquet"
+    cand = candidates(m, meta["lambda"], od, pd.read_parquet(exf) if exf.exists() else None)
 
     def run(df):
         return evaluate(book, ((r, bt, c, 100) for r, bt, c in df[["race_id", "bet_type", "combo"]].itertuples(index=False)))

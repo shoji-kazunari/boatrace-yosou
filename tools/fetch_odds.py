@@ -1,4 +1,4 @@
-"""boatrace.jp から過去レースの確定オッズ（単勝・複勝 / 2連単・2連複）を取得し、HTMLのまま保存する。
+"""boatrace.jp から過去レースの確定オッズ（単勝・複勝 / 2連単・2連複）と直前情報を取得し、HTMLのまま保存する。
 使い方: python3 tools/fetch_odds.py 2025-07-01 2026-11-22 6   # 6日おき
 
 - 対象レースは成績ファイル(K)に載っているものだけ。Kが無ければ先に取る
@@ -15,7 +15,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import download, parse  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent / "data" / "raw"
-PAGES = ("oddstf", "odds2tf")
+PAGES = ("oddstf", "odds2tf", "beforeinfo")  # beforeinfo = 直前情報（展示進入・展示ST・チルト・部品交換）
 WORKERS = 8
 
 
@@ -44,7 +44,7 @@ def get(d, venue, rno, page):
         try:
             with urllib.request.urlopen(url, timeout=60) as r:
                 body = r.read()
-            if b"oddsPoint" not in body:
+            if page.startswith("odds") and b"oddsPoint" not in body:
                 print("noodds", d, venue, rno, page, flush=True)
             out.write_bytes(gzip.compress(body))
             return

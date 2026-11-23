@@ -64,19 +64,65 @@ def parse_tf(html):
     return out
 
 
+def parse_before(html):
+    """直前情報ページ → [(lane, 展示進入コース, 展示ST, 展示F, チルト, 調整重量, 部品交換, プロペラ, 展示タイム)]。
+    スタート展示の表は上から1コース,2コース…の順に並び、各行に艇番とSTがある。"""
+    h = re.sub(r"\s+", " ", html)
+    info = {}
+    # 艇ごとのブロック（tbody 1つ＝1艇）
+    i0 = h.find("チルト")
+    for tb in re.findall(r'<tbody class="is-fs12 ?">(.*?)</tbody>', h[i0:] if i0 >= 0 else ""):
+        tds = TD.findall(tb)
+        txt = [re.sub(r"<[^>]+>", "", v).replace("&nbsp;", "").strip() for _, v in tds]
+        if not txt or not txt[0].isdigit():
+            continue
+        lane = int(txt[0])
+        # 並び: 枠, 写真, 名前, 体重, 展示タイム, チルト, プロペラ, 部品交換, ...  2行目以降に 調整重量
+        ex_time, tilt, prop = odds_val(txt[4]), odds_val(txt[5]), txt[6]
+        parts = ",".join(re.findall(r"<li[^>]*>(.*?)</li>", tds[7][1]))
+        parts = re.sub(r"<[^>]+>|\s", "", parts)
+        adj = None
+        for k in range(8, len(txt) - 1):
+            if txt[k + 1] == "ST" and odds_val(txt[k]) is not None:
+                adj = odds_val(txt[k])
+        info[lane] = dict(tilt=tilt, adj=adj, parts=parts, prop=prop, ex_time=ex_time)
+    st = {}
+    j = h.find("スタート展示")
+    if j >= 0:
+        seg = h[j:h.find("</table>", j)]
+        for course, (lane, t) in enumerate(re.findall(
+                r'table1_boatImage1Number[^>]*>(\d)</span>.*?table1_boatImage1Time[^>]*>([^<]*)<', seg), start=1):
+            t = t.strip()
+            f = t.startswith("F")
+            v = odds_val(t.lstrip("FL")) if t else None
+            st[int(lane)] = (course, -v if (f and v is not None) else v, int(f))
+    out = []
+    for lane in range(1, 7):
+        a, b = info.get(lane, {}), st.get(lane, (None, None, None))
+        out.append((lane, b[0], b[1], b[2], a.get("tilt"), a.get("adj"), a.get("parts"), a.get("prop"), a.get("ex_time")))
+    return out
+
+
 def main():
     con = sqlite3.connect(ROOT / "boatrace.sqlite")
     con.execute("DROP TABLE IF EXISTS odds")
     con.execute("CREATE TABLE odds(race_id TEXT, bet_type TEXT, combo TEXT, odds REAL)")
+    con.execute("DROP TABLE IF EXISTS before")
+    con.execute("CREATE TABLE before(race_id TEXT, lane INTEGER, ex_course INTEGER, ex_st REAL, ex_f INTEGER,"
+                " tilt REAL, adj_weight REAL, parts TEXT, propeller TEXT, ex_time REAL)")
     n = 0
     for p in sorted((ROOT / "raw" / "web").glob("*/*.html.gz")):
         date = p.parent.name
         venue, rno = int(p.name[:2]), int(p.name[2:4])
         page = p.name.split("_")[1].split(".")[0]
         html = gzip.decompress(p.read_bytes()).decode("utf8", "replace")
-        recs = parse_2tf(html) if page == "odds2tf" else parse_tf(html)
         rid = f"{date}-{venue:02d}-{rno:02d}"
-        con.executemany("INSERT INTO odds VALUES(?,?,?,?)", [(rid, *r) for r in recs])
+        if page == "beforeinfo":
+            con.executemany("INSERT INTO before VALUES(?,?,?,?,?,?,?,?,?,?)",
+                            [(rid, *r) for r in parse_before(html)])
+        else:
+            recs = parse_2tf(html) if page == "odds2tf" else parse_tf(html)
+            con.executemany("INSERT INTO odds VALUES(?,?,?,?)", [(rid, *r) for r in recs])
         n += 1
     con.execute("CREATE INDEX IF NOT EXISTS ix_odds ON odds(race_id, bet_type)")
     con.commit()

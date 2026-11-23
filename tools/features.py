@@ -1,5 +1,6 @@
 """1艇1行の特徴量テーブルを作る（data/features.parquet）。
-使い方: python3 tools/features.py
+使い方: python3 tools/features.py [--course]
+  --course  展示進入（直前情報）で進入コースを決める版を data/features_course.parquet に作る
 
 未来の情報を混ぜないための約束:
   - 選手の過去成績（コース別・ST・着順）は「そのレース日の前日まで」のレースだけで集計する
@@ -8,18 +9,19 @@
     モデルを「展示なし」「展示あり」に分けて比べること
   - 風・波(wind/wave)は成績ファイルの値＝レース時点。直前情報とほぼ同じだが厳密には締切後の値
 """
-import pathlib, sqlite3
+import pathlib, sqlite3, sys
 import numpy as np
 import pandas as pd
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent / "data"
+USE_COURSE = "--course" in sys.argv
 GRADE = {"A1": 4, "A2": 3, "B1": 2, "B2": 1}
 
 
 def load(con):
     races = pd.read_sql("SELECT * FROM races", con)
     cards = pd.read_sql("SELECT * FROM cards", con)
-    res = pd.read_sql("SELECT race_id,lane,rank_raw,rank,toban,exhibit,course,st,st_raw FROM results", con)
+    res = pd.read_sql("SELECT race_id,lane,rank_raw,rank,toban,motor,exhibit,course,st,st_raw FROM results", con)
     return races, cards, res
 
 
@@ -59,15 +61,20 @@ def history_feats(res, races):
     r["k_nuki"] = (won & (r["kimarite"] == "抜き")).astype(int)
     # 1コースで負けた理由（=内で弱いか）: 1コースで1着を逃した回数
     r["in_lost"] = ((r["course"] == 1) & (r["rank"] != 1)).astype(int) * r["start"]
-    cols = ["start", "win", "top2", "fly", "st_n", "st_sum", "rank_f", "outer_start", "in_start",
+    cols = ["start", "win", "top2", "fly", "st_n", "st_sum", "st_sq", "rank_f", "outer_start", "in_start",
             "k_nige", "k_makuri", "k_sashi", "k_mz", "k_nuki", "in_lost"]
-    a = (r.assign(st_n=r["st_ok"].notna().astype(int), st_sum=r["st_ok"].fillna(0))
+    a = (r.assign(st_n=r["st_ok"].notna().astype(int), st_sum=r["st_ok"].fillna(0),
+                  st_sq=r["st_ok"].fillna(0) ** 2)
          .groupby(["toban", "date"])[cols].sum()
          .groupby(level=0).cumsum().reset_index())
     # レース場別（その場の水面との相性）
     v = (r.groupby(["toban", "venue", "date"])[["start", "win", "top2"]].sum()
          .groupby(level=[0, 1]).cumsum().reset_index())
-    return c, a, v
+    # モーター（場×モーター番号）の成績。番組表の2連率は導入時からの累計なので、直近の調子を別に持つ
+    mo = (r.dropna(subset=["motor"]).assign(motor_no=lambda x: x["motor"].astype(int))
+          .groupby(["venue", "motor_no", "date"])[["start", "top2", "win"]].sum()
+          .groupby(level=[0, 1]).cumsum().reset_index())
+    return c, a, v, mo
 
 
 def asof_prev(left, right, by, prefix):
@@ -78,6 +85,18 @@ def asof_prev(left, right, by, prefix):
     left = left.sort_values("date")
     out = pd.merge_asof(left, right, on="date", by=by, direction="backward")
     return out.rename(columns={k: prefix + k for k in right.columns if k not in by + ["date"]})
+
+
+def asof_window(left, right, by, prefix, days):
+    """前日までの累積 − (days日前までの累積) ＝ 直近 days 日間の値を付ける。"""
+    cols = [k for k in right.columns if k not in by + ["date"]]
+    now = asof_prev(left[["date"] + by].reset_index(), right, by, "n_").set_index("index").sort_index()
+    past_left = left[["date"] + by].assign(date=left["date"] - pd.Timedelta(days=days)).reset_index()
+    past = asof_prev(past_left, right, by, "p_").set_index("index").sort_index()
+    out = left.copy()
+    for k in cols:
+        out[prefix + k] = now["n_" + k].fillna(0) - past["p_" + k].fillna(0)
+    return out
 
 
 def main():
@@ -93,10 +112,31 @@ def main():
     ss = df["series"].map(series_stats)
     df["ser_n"] = [x[0] for x in ss]
     df["ser_avg"] = [x[1] for x in ss]
+    # 予想に使う進入コース。
+    #   既定: 枠なり（lane）
+    #   --course: 直前情報の展示進入があればそれを使う。無いレース（学習期間）は本番の進入で代用する。
+    #             展示進入と本番進入はほぼ一致するので学習の代用として使い、評価は本物の展示進入で行う
     df["plan_course"] = df["lane"]
+    if USE_COURSE:
+        df["plan_course"] = df["course"].fillna(df["lane"]).astype(int)
+        try:
+            bf = pd.read_sql("SELECT race_id, lane, ex_course FROM before WHERE ex_course IS NOT NULL", con)
+            df = df.merge(bf, on=["race_id", "lane"], how="left")
+            has = df.groupby("race_id")["ex_course"].transform("count") == 6
+            df.loc[has, "plan_course"] = df.loc[has, "ex_course"].astype(int)
+            df = df.drop(columns="ex_course")
+            print("展示進入を使ったレース", int(has.sum() / 6))
+        except Exception as e:  # before テーブルがまだ無い
+            print("展示進入なし:", e)
+    df["course_changed"] = (df["plan_course"] != df["lane"]).astype(int)
 
-    c, a, v = history_feats(res, races)
+    c, a, v, mo = history_feats(res, races)
     c = c.rename(columns={"course": "plan_course"})
+    df = df.reset_index(drop=True)
+    # 直近の調子（90日）・F持ち（直近180日のフライング）・モーターの直近（120日）
+    df = asof_window(df, a[["toban", "date", "start", "win", "top2", "rank_f"]], ["toban"], "h90_", 90)
+    df = asof_window(df, a[["toban", "date", "fly"]], ["toban"], "h180_", 180)
+    df = asof_window(df, mo, ["venue", "motor_no"], "mo_", 120)
     df = asof_prev(df, c, ["toban", "plan_course"], "hc_")
     df = asof_prev(df, a, ["toban"], "ha_")
     df = asof_prev(df, v, ["toban", "venue"], "hv_")
@@ -105,15 +145,28 @@ def main():
 
     # 少ない標本を全体平均に寄せる（縮小）。コースごとの全体平均を事前分布にする
     K = 20
-    prior = df.groupby("lane")["rank"].agg(lambda s: (s == 1).mean())
-    prior2 = df.groupby("lane")["rank"].agg(lambda s: (s <= 2).mean())
-    prior3 = df.groupby("lane")["rank"].agg(lambda s: (s <= 3).mean())
-    df["hc_win_r"] = (df["hc_win"] + K * df["lane"].map(prior)) / (df["hc_start"] + K)
-    df["hc_top2_r"] = (df["hc_top2"] + K * df["lane"].map(prior2)) / (df["hc_start"] + K)
-    df["hc_top3_r"] = (df["hc_top3"] + K * df["lane"].map(prior3)) / (df["hc_start"] + K)
+    # 事前分布は学習期間の終わり(2025-06)までのデータだけで作る（調整・試験期間の結果を混ぜない）
+    early = df[df["date"] < "2025-07-01"]
+    prior = early.groupby("lane")["rank"].agg(lambda s: (s == 1).mean())
+    prior2 = early.groupby("lane")["rank"].agg(lambda s: (s <= 2).mean())
+    prior3 = early.groupby("lane")["rank"].agg(lambda s: (s <= 3).mean())
+    df["hc_win_r"] = (df["hc_win"] + K * df["plan_course"].map(prior)) / (df["hc_start"] + K)
+    df["hc_top2_r"] = (df["hc_top2"] + K * df["plan_course"].map(prior2)) / (df["hc_start"] + K)
+    df["hc_top3_r"] = (df["hc_top3"] + K * df["plan_course"].map(prior3)) / (df["hc_start"] + K)
     df["ha_win_r"] = (df["ha_win"] + K / 6) / (df["ha_start"] + K)
     df["ha_avg_rank"] = (df["ha_rank_f"] + K * 3.5) / (df["ha_start"] + K)
     df["ha_avg_st"] = (df["ha_st_sum"] + 10 * 0.16) / (df["ha_st_n"] + 10)
+    # STのばらつき（標準偏差）。平均が同じでも、安定して決める選手と博打の選手を分ける
+    var = (df["ha_st_sq"] + 10 * (0.16 ** 2 + 0.04 ** 2)) / (df["ha_st_n"] + 10) - df["ha_avg_st"] ** 2
+    df["ha_st_sd"] = np.sqrt(np.clip(var, 0, None))
+    # 直近90日の調子（全期間の平均着順との差。マイナス＝最近好調）
+    df["h90_avg_rank"] = (df["h90_rank_f"] + 10 * df["ha_avg_rank"]) / (df["h90_start"] + 10)
+    df["form_delta"] = df["h90_avg_rank"] - df["ha_avg_rank"]
+    df["f_hold"] = (df["h180_fly"] > 0).astype(int)   # F持ち（スタートを控えやすい）
+    # モーター直近120日の2連率（縮小つき）と、番組表の累計2連率との差
+    df["mo_top2_r"] = (df["mo_top2"] + 20 * 0.333) / (df["mo_start"] + 20)
+    df["mo_delta"] = df["mo_top2_r"] * 100 - df["motor_2"]
+    df["wind_dir_c"] = df["wind_dir"].astype("category")
 
     # 戦い方（外枠からの出走あたりの決まり手別勝率、縮小つき）
     for k, base in [("makuri", 0.045), ("sashi", 0.035), ("mz", 0.03), ("nuki", 0.02)]:
@@ -126,15 +179,15 @@ def main():
     df["hv_top2_r"] = (df["hv_top2"] + K * 2 * df["ha_win_r"]) / (df["hv_start"] + K)
     df["hv_gain"] = df["hv_win_r"] - df["ha_win_r"]  # その場で普段よりどれだけ勝つか
 
-    # 隣の艇との関係（並びはレース内で lane 順）
-    df = df.sort_values(["race_id", "lane"]).reset_index(drop=True)
+    # 隣の艇との関係（並びはレース内で 予想進入コース順）
+    df = df.sort_values(["race_id", "plan_course", "lane"]).reset_index(drop=True)
     g = df.groupby("race_id")
     df["in_st"] = g["ha_avg_st"].shift(1)                 # 1つ内側の艇の平均ST
     df["st_adv_in"] = df["in_st"] - df["ha_avg_st"]        # 内より速い(+)ならまくりやすい
     df["in_nige"] = g["st_nige"].shift(1)
     df["out_attack"] = g["st_attack"].shift(-1)           # 1つ外の艇の攻め型の強さ（自分が叩かれる危険）
     df["out_st_adv"] = df.groupby("race_id")["st_adv_in"].shift(-1)
-    lane1 = df[df.lane == 1].set_index("race_id")
+    lane1 = df[df.plan_course == 1].drop_duplicates("race_id").set_index("race_id")
     df["r_lane1_nige"] = df["race_id"].map(lane1["st_nige"])   # 1号艇の逃げの強さ（全艇に効く）
     df["r_lane1_st"] = df["race_id"].map(lane1["ha_avg_st"])
     df["attack_x_adv"] = df["st_attack"] * df["st_adv_in"].fillna(0)  # 攻め型 × 内より速い
@@ -142,7 +195,8 @@ def main():
     # レース内の相対値（同じレースの他艇と比べてどうか）
     g = df.groupby("race_id")
     for k in ["nat_win", "loc_win", "motor_2", "boat_2", "grade_n", "hc_win_r", "hc_top2_r",
-              "ha_avg_st", "ha_avg_rank", "exhibit", "age", "weight", "hv_win_r", "st_attack"]:
+              "ha_avg_st", "ha_avg_rank", "exhibit", "age", "weight", "hv_win_r", "st_attack",
+              "mo_top2_r", "h90_avg_rank", "ha_st_sd"]:
         df[k + "_rel"] = df[k] - g[k].transform("mean")
         df[k + "_rk"] = g[k].rank(ascending=k in ("ha_avg_st", "ha_avg_rank", "exhibit"), method="average")
     df["ex_min_gap"] = df["exhibit"] - g["exhibit"].transform("min")
@@ -152,7 +206,7 @@ def main():
     df["race_class_c"] = df["race_class"].astype("category")
     df = df.sort_values(["date", "race_id", "lane"]).reset_index(drop=True)
     df.drop(columns=["name", "branch", "series", "early", "rank_raw", "kimarite", "deadline",
-                     "race_class", "weather", "wind_dir"]).to_parquet(ROOT / "features.parquet")
+                     "race_class", "weather", "wind_dir"], errors="ignore").to_parquet(ROOT / ("features_course.parquet" if USE_COURSE else "features.parquet"))
     print(df.shape, df["date"].min().date(), df["date"].max().date())
 
 
