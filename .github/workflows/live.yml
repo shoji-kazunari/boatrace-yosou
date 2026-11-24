@@ -1,0 +1,168 @@
+# 締切前オッズでの紙上記録を毎日動かす（お金は賭けない）。
+# 1回の実行は6時間までなので、取得時刻で朝・昼・夕の3つに分ける。受け持ちは重ならない。
+#   朝   07:07 JST 開始 … 前日分の答え合わせ → 当日の準備（番組表・特徴量・週1回の学習）→ 〜12:30 のレース
+#   昼   12:07 JST 開始 … 12:30〜17:30 のレース
+#   夕   17:07 JST 開始 … 17:30〜 のレース（ナイター）
+# 準備した特徴量・モデル・公式データはキャッシュで次の回に渡す。記録は records/live/ にコミットする。
+name: live
+
+on:
+  schedule:
+    - cron: "7 22 * * *"   # 07:07 JST
+    - cron: "7 3 * * *"    # 12:07 JST
+    - cron: "7 8 * * *"    # 17:07 JST
+  workflow_dispatch:
+    inputs:
+      part:
+        description: 受け持ち
+        type: choice
+        options: [morning, midday, evening]
+        default: morning
+
+permissions:
+  contents: write
+
+concurrency:
+  group: live-${{ github.event.schedule || inputs.part }}
+  cancel-in-progress: false
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      TZ: Asia/Tokyo
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: 受け持ちと日付
+        id: p
+        run: |
+          case "${{ github.event.schedule }}" in
+            "7 22 * * *") part=morning ;;
+            "7 3 * * *")  part=midday ;;
+            "7 8 * * *")  part=evening ;;
+            *)            part="${{ inputs.part }}" ;;
+          esac
+          case "$part" in
+            morning) s=00:00; e=12:30 ;;
+            midday)  s=12:30; e=17:30 ;;
+            evening) s=17:30; e=24:00 ;;
+          esac
+          echo "part=$part" >> "$GITHUB_OUTPUT"
+          echo "start=$s" >> "$GITHUB_OUTPUT"
+          echo "end=$e" >> "$GITHUB_OUTPUT"
+          echo "day=$(date +%Y%m%d)" >> "$GITHUB_OUTPUT"
+          echo "yesterday=$(date -d yesterday +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+          echo "$part $s-$e $(date)"
+
+      - name: モデルを戻す
+        uses: actions/cache/restore@v4
+        with:
+          path: data/model
+          key: model-${{ steps.p.outputs.day }}
+          restore-keys: model-
+
+      - name: 当日の準備を戻す
+        id: state
+        uses: actions/cache/restore@v4
+        with:
+          path: data/live
+          key: state-${{ steps.p.outputs.day }}
+
+      - name: 公式データを戻す
+        if: steps.state.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            data/raw/K
+            data/raw/B
+          key: raw-${{ steps.p.outputs.day }}
+          restore-keys: raw-
+
+      - name: 公式データを取得・当日の準備
+        if: steps.state.outputs.cache-hit != 'true'
+        run: |
+          python3 tools/download.py 2023-01-01 ${{ steps.p.outputs.yesterday }} | tail -20
+          python3 tools/live.py prepare ${{ steps.p.outputs.day }}
+
+      - name: 公式データを保存
+        if: steps.state.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            data/raw/K
+            data/raw/B
+          key: raw-${{ steps.p.outputs.day }}-${{ github.run_id }}
+
+      - name: 学習（モデルが無いか、7日以上前のとき）
+        id: train
+        if: steps.state.outputs.cache-hit != 'true'
+        run: |
+          need=$(python3 - <<'PY'
+          import json, pathlib, datetime
+          p = pathlib.Path("data/model/config.json")
+          if not p.exists():
+              print("yes")
+          else:
+              d = datetime.date.fromisoformat(json.loads(p.read_text())["trained_through"])
+              print("yes" if (datetime.date.today() - d).days > 7 else "no")
+          PY
+          )
+          echo "need=$need" >> "$GITHUB_OUTPUT"
+          if [ "$need" = yes ]; then python3 tools/live.py train ${{ steps.p.outputs.day }}; fi
+
+      - name: モデルを保存
+        if: steps.train.outputs.need == 'yes'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: data/model
+          key: model-${{ steps.p.outputs.day }}-${{ github.run_id }}
+
+      - name: 当日の準備を保存
+        if: steps.state.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: data/live
+          key: state-${{ steps.p.outputs.day }}
+
+      - name: 答え合わせ（結果の出ている未照合の日）
+        if: steps.state.outputs.cache-hit != 'true'
+        continue-on-error: true
+        run: python3 tools/live.py settle ${{ steps.p.outputs.day }}
+
+      - name: 記録
+        run: python3 tools/live.py run ${{ steps.p.outputs.day }} ${{ steps.p.outputs.start }} ${{ steps.p.outputs.end }} ${{ steps.p.outputs.part }}
+
+      - name: 記録をコミット
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git add records
+          git diff --cached --quiet && exit 0
+          git commit -m "紙上記録 ${{ steps.p.outputs.day }} ${{ steps.p.outputs.part }}"
+          for i in 1 2 3 4; do
+            git pull --rebase -q && git push -q && exit 0
+            sleep $((i * 10))
+          done
+          exit 1
+
+      - name: 取得したページを残す
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pages-${{ steps.p.outputs.day }}-${{ steps.p.outputs.part }}
+          path: data/raw/live/${{ steps.p.outputs.day }}
+          if-no-files-found: ignore
+          retention-days: 90

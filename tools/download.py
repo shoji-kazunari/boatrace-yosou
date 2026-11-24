@@ -13,6 +13,7 @@ def fetch(kind, d):
     yymmdd = d.strftime("%y%m%d")
     url = f"{BASE}/{kind}/{d:%Y%m}/{kind.lower()}{yymmdd}.lzh"
     out = ROOT / kind / f"{kind.lower()}{yymmdd}.lzh"
+    out.parent.mkdir(parents=True, exist_ok=True)
     if out.exists() and out.stat().st_size > 0:
         return "skip"
     for attempt in range(4):

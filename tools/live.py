@@ -3,13 +3,18 @@
 実戦で見える「締切数分前のオッズ」でも期待値の高い舟券が当たるのかを、ここで確かめる。
 
 使い方:
-  python3 tools/live.py train              # 前日までの全データで学習し data/live/ に保存（1日1回）
-  python3 tools/live.py prepare [YYYYMMDD]  # 当日の番組表を取得し、当日分の特徴量を作る
-  python3 tools/live.py run [YYYYMMDD]      # 各レースの締切5分前に直前情報とオッズを取り、記録する
-  python3 tools/live.py settle YYYYMMDD     # 翌日以降に結果と確定オッズで答え合わせ
+  python3 tools/live.py prepare [YYYYMMDD]         # 当日の番組表を取得し、当日分の特徴量とレース一覧を作る
+  python3 tools/live.py train [YYYYMMDD]           # その日の前日までの全データで学習し data/model/ に保存
+  python3 tools/live.py run [YYYYMMDD] [開始 終了]  # 取得時刻（締切5分前）が 開始〜終了(HH:MM) のレースを記録する
+  python3 tools/live.py settle [YYYYMMDD]          # 結果が出ている未照合の日をすべて答え合わせし、集計を作り直す
 
-記録: data/live/<日付>_cands.csv … 期待値1以上の全候補（券種・組・確率・締切前オッズ・取得時刻）
-      data/raw/live/<日付>/…      … 取得したページそのもの
+毎日の実行は GitHub Actions（.github/workflows/live.yml）。1回6時間までなので、1日を朝・昼・夕の3回に分ける。
+
+記録（リポジトリにコミットする）:
+  records/live/<日付>_cands_<区分>.csv … 期待値1以上の全候補（券種・組・確率・締切前オッズ・取得時刻）
+  records/live/<日付>_settled.csv      … 候補ごとの払戻（1点100円）
+  records/live/SUMMARY.md              … 全期間の集計（日単位ブートストラップの95%区間つき）
+取得したページそのものは data/raw/live/<日付>/ に保存（Actions では成果物として90日残す）
 
 モデル: 1着=レース単位の多項ロジット、2着・3着=条件付きモデル。特徴量は BASE+STYLE+FORM+EX から
        風向き（締切前に正確に取れない）を除いたもの。展示タイム・風速・波高は直前情報ページの値を使う。
@@ -30,7 +35,10 @@ import strategies as S  # noqa: E402
 import download  # noqa: E402
 
 ROOT = HERE.parent / "data"
-LIVE = ROOT / "live"
+LIVE = ROOT / "live"                       # その日の特徴量・レース一覧（作業用）
+MODEL = ROOT / "model"                     # 学習済みモデル
+REC = HERE.parent / "records" / "live"     # 記録（コミットする）
+FULL = "features_live.parquet"             # prepare が作る全期間の特徴量（train が使う）
 JST = datetime.timezone(datetime.timedelta(hours=9))
 FEATS = [f for f in M.BASE + M.STYLE + M.FORM + M.EX if f != "wind_dir_c"]
 PAGES = ("beforeinfo", "oddstf", "odds2tf", "odds3t")
@@ -48,10 +56,12 @@ def sh(*a):
 
 
 # ---------- 学習 ----------
-def train():
-    LIVE.mkdir(parents=True, exist_ok=True)
-    df = pd.read_parquet(ROOT / "features.parquet")
+def train(day):
+    MODEL.mkdir(parents=True, exist_ok=True)
+    src = ROOT / FULL if (ROOT / FULL).exists() else ROOT / "features.parquet"
+    df = pd.read_parquet(src)
     df["date"] = df["date"].dt.strftime("%Y-%m-%d")
+    df = df[df.date < f"{day[:4]}-{day[4:6]}-{day[6:]}"]   # 当日以降（結果なし）は使わない
     df = df[df.groupby("race_id")["lane"].transform("count") == 6].sort_values(["race_id", "lane"])
     last = df["date"].max()
     cut = (pd.Timestamp(last) - pd.Timedelta(days=60)).strftime("%Y-%m-%d")
@@ -68,12 +78,12 @@ def train():
     t1 = minimize_scalar(lambda x: M.race_nll(va, M.race_softmax(va, sv, x)), bounds=(0.3, 3), method="bounded").x
     m2, f2, t2, _ = M.train_second(tr, va, FEATS, params)
     m3, f3, t3, _ = M.train_third(tr, va, FEATS, params)
-    m1.save_model(str(LIVE / "m1.txt"), num_iteration=m1.best_iteration)
-    m2.save_model(str(LIVE / "m2.txt"), num_iteration=m2.best_iteration)
-    m3.save_model(str(LIVE / "m3.txt"), num_iteration=m3.best_iteration)
+    m1.save_model(str(MODEL / "m1.txt"), num_iteration=m1.best_iteration)
+    m2.save_model(str(MODEL / "m2.txt"), num_iteration=m2.best_iteration)
+    m3.save_model(str(MODEL / "m3.txt"), num_iteration=m3.best_iteration)
     cfg = {"trained_through": last, "t1": float(t1), "t2": t2, "t3": t3, "f2": f2, "f3": f3, "feats": FEATS,
            "cats": {c: list(df[c].cat.categories) for c in cats if hasattr(df[c], "cat")}}
-    (LIVE / "config.json").write_text(json.dumps(cfg, ensure_ascii=False))
+    (MODEL / "config.json").write_text(json.dumps(cfg, ensure_ascii=False))
     print("学習完了", last, "温度", t1, t2, t3)
 
 
@@ -84,11 +94,15 @@ def prepare(day):
         download.fetch(k, d - datetime.timedelta(days=1))
     download.fetch("B", d)
     sh("tools/parse.py")
-    sh("tools/features.py", "--keep-open", day, "--out", f"live/feats_{day}.parquet")
-    f = pd.read_parquet(LIVE / f"feats_{day}.parquet")
+    sh("tools/features.py", "--keep-open", day, "--out", FULL)
+    LIVE.mkdir(parents=True, exist_ok=True)
+    f = pd.read_parquet(ROOT / FULL)
     f = f[f["date"].dt.strftime("%Y%m%d") == day]
     f.to_parquet(LIVE / f"feats_{day}.parquet")
-    print("当日のレース", f.race_id.nunique())
+    races = pd.read_sql("SELECT race_id, venue, rno, deadline FROM races WHERE date=? AND deadline IS NOT NULL",
+                        sqlite3.connect(ROOT / "boatrace.sqlite"), params=(day,))
+    races.to_csv(LIVE / f"races_{day}.csv", index=False)
+    print("当日のレース", f.race_id.nunique(), "締切あり", len(races))
 
 
 # ---------- 記録 ----------
@@ -131,34 +145,53 @@ def predict_race(g, before_html, cfg, m1, m2, m3):
     return g, p1, P2, P3
 
 
-def run(day):
-    cfg = json.loads((LIVE / "config.json").read_text())
-    m1, m2, m3 = (lgb.Booster(model_file=str(LIVE / f"m{k}.txt")) for k in (1, 2, 3))
+def hm(day, s):
+    hh, mm = map(int, s.split(":"))
+    base = datetime.datetime(int(day[:4]), int(day[4:6]), int(day[6:]), tzinfo=JST)
+    return base + datetime.timedelta(hours=hh, minutes=mm)   # "24:00" も可
+
+
+def run(day, start="00:00", end="24:00", part="all"):
+    """取得時刻（締切 LEAD_MIN 分前）が [start, end) に入るレースだけを受け持つ。
+    朝・昼・夕の3回に分けて動かすので、受け持ちが重ならないよう区切る。"""
+    cfg = json.loads((MODEL / "config.json").read_text())
+    m1, m2, m3 = (lgb.Booster(model_file=str(MODEL / f"m{k}.txt")) for k in (1, 2, 3))
     feats = pd.read_parquet(LIVE / f"feats_{day}.parquet")
     for c, cats in cfg["cats"].items():
         feats[c] = pd.Categorical(feats[c], categories=cats)
-    races = sqlite3.connect(ROOT / "boatrace.sqlite").execute(
-        "SELECT race_id, venue, rno, deadline FROM races WHERE date=? AND deadline IS NOT NULL", (day,)).fetchall()
+    rc = LIVE / f"races_{day}.csv"
+    if rc.exists():
+        races = pd.read_csv(rc).itertuples(index=False, name=None)
+    else:
+        races = sqlite3.connect(ROOT / "boatrace.sqlite").execute(
+            "SELECT race_id, venue, rno, deadline FROM races WHERE date=? AND deadline IS NOT NULL", (day,)).fetchall()
+    lo, hi = hm(day, start), hm(day, end)
+    lead = datetime.timedelta(minutes=LEAD_MIN)
     todo = {}
     for rid, v, r, dl in races:
-        hh, mm = map(int, dl.split(":"))
-        t = datetime.datetime(int(day[:4]), int(day[4:6]), int(day[6:]), hh, mm, tzinfo=JST)
-        todo[rid] = (v, r, t)
-    out = LIVE / f"{day}_cands.csv"
-    done = set(pd.read_csv(out).race_id) if out.exists() else set()
-    print(f"{day}: {len(todo)}レース（記録済み {len(done)}）", flush=True)
+        t = hm(day, dl)
+        if lo <= t - lead < hi:
+            todo[rid] = (int(v), int(r), t)
+    REC.mkdir(parents=True, exist_ok=True)
+    out = REC / f"{day}_cands_{part}.csv"
+    done = set()
+    for f in REC.glob(f"{day}_cands*.csv"):
+        done |= set(pd.read_csv(f).race_id)
+    print(f"{day} {part} {start}-{end}: 受け持ち {len(todo)}レース（記録済み {len(done & set(todo))}）", flush=True)
     pool = ThreadPoolExecutor(8)
-    while True:
+    while todo:
         now = datetime.datetime.now(JST)
         due = [rid for rid, (v, r, t) in todo.items()
-               if rid not in done and t - datetime.timedelta(minutes=LEAD_MIN) <= now < t - datetime.timedelta(minutes=1)]
+               if rid not in done and t - lead <= now < t - datetime.timedelta(minutes=1)]
         for rid in due:
             done.add(rid)
             pool.submit(record, day, rid, *todo[rid], feats, cfg, m1, m2, m3, out)
-        if all(t < now for _, _, t in todo.values()):
+        if all(t - datetime.timedelta(minutes=1) <= now for _, _, t in todo.values()):
             break
         time.sleep(15)
     pool.shutdown(wait=True)
+    n = len(pd.read_csv(out).race_id.unique()) if out.exists() else 0
+    print(f"{day} {part}: 記録 {n}レース / 受け持ち {len(todo)}", flush=True)
 
 
 def record(day, rid, venue, rno, deadline, feats, cfg, m1, m2, m3, out):
@@ -203,27 +236,68 @@ def record(day, rid, venue, rno, deadline, feats, cfg, m1, m2, m3, out):
 
 
 # ---------- 答え合わせ ----------
-def settle(day):
-    d = datetime.date(int(day[:4]), int(day[4:6]), int(day[6:]))
-    download.fetch("K", d)
-    sh("tools/parse.py")
+THS = (1.0, 1.2, 1.5, 2.0)
+
+
+def settle(today_):
+    """結果が DB に入っていて、まだ照合していない日をすべて照合し、全期間の集計を作り直す。
+    結果ファイル(K)は翌朝に出るので、DB は prepare（前日分のKを取って作り直す）の後のものを使う。"""
     from backtest import Book
     con = sqlite3.connect(ROOT / "boatrace.sqlite")
-    book = Book(con, day, day)
-    c = pd.read_csv(LIVE / f"{day}_cands.csv")
-    c = c[c.bet_type != "none"]
-    c["back"] = [book.settle(r, bt, cb, 100) if r in book.races else np.nan
-                 for r, bt, cb in zip(c.race_id, c.bet_type, c.combo)]
-    c = c.dropna(subset=["back"])
-    c.to_csv(LIVE / f"{day}_settled.csv", index=False)
-    print(f"{day} 記録したレース {c.race_id.nunique()}")
-    for th in (1.0, 1.2, 1.5, 2.0):
+    days = sorted({f.name[:8] for f in REC.glob("*_cands*.csv")})
+    for day in days:
+        if day >= today_ or (REC / f"{day}_settled.csv").exists():
+            continue
+        book = Book(con, day, day)
+        if not book.races:
+            print(day, "結果がまだ無い")
+            continue
+        c = pd.concat([pd.read_csv(f) for f in sorted(REC.glob(f"{day}_cands*.csv"))])
+        c = c[c.bet_type != "none"].drop_duplicates(["race_id", "bet_type", "combo"])
+        c["back"] = [book.settle(r, bt, cb, 100) if r in book.races else np.nan
+                     for r, bt, cb in zip(c.race_id, c.bet_type, c.combo)]
+        c = c.dropna(subset=["back"])
+        c.to_csv(REC / f"{day}_settled.csv", index=False)
+        print(day, "照合", c.race_id.nunique(), "レース")
+    summary()
+
+
+def summary():
+    fs = sorted(REC.glob("*_settled.csv"))
+    if not fs:
+        return
+    c = pd.concat([pd.read_csv(f).assign(day=f.name[:8]) for f in fs])
+    rng = np.random.default_rng(0)
+    rows = []
+    for th in THS:
         for bt, g in c[c.ev >= th].groupby("bet_type"):
-            print(f"  EV>={th} {bt:<11} {len(g):4d}点  的中 {(g.back > 100).mean()*100:5.1f}%  回収率 {g.back.mean():6.1f}%")
+            by = g.groupby("day").agg(inv=("back", "size"), back=("back", "sum"))
+            inv, back = by.inv.to_numpy() * 100, by.back.to_numpy()
+            idx = rng.integers(0, len(by), (2000, len(by)))
+            boot = back[idx].sum(1) / inv[idx].sum(1) * 100
+            wo = (g.back.sum() - g.back.max()) / (len(g) * 100) * 100
+            rows.append((bt, th, len(by), g.race_id.nunique(), len(g), (g.back > 0).mean() * 100,
+                         back.sum() / inv.sum() * 100, np.percentile(boot, 2.5), np.percentile(boot, 97.5), wo))
+    t = pd.DataFrame(rows, columns=["券種", "EV≥", "日数", "レース", "点数", "払戻あり%", "回収率%", "下限%", "上限%", "最大除く%"])
+    order = {b: i for i, b in enumerate(["tan", "fuku", "wide", "nirenpuku", "nirentan", "sanrenpuku", "sanrentan"])}
+    t = t.sort_values(["券種", "EV≥"], key=lambda x: x.map(order) if x.name == "券種" else x)
+    t.to_csv(REC / "summary.csv", index=False)
+    lines = ["# 締切前オッズでの紙上記録（お金は賭けていない）", "",
+             f"期間 {fs[0].name[:8]}〜{fs[-1].name[:8]}（{len(fs)}日）。1点100円で、期待値（混合確率×締切5分前オッズ）が閾値以上の舟券をすべて買ったとき。",
+             "95%区間は日単位のブートストラップ。**下限が100%を超え続けて初めて『利益が出る』と言える。**", "",
+             "| 券種 | EV≥ | 日数 | レース | 点数 | 払戻あり | 回収率 | 95%区間 | 最大払戻を除く |", "|---|---|---|---|---|---|---|---|---|"]
+    jp = {"tan": "単勝", "fuku": "複勝", "wide": "拡連複", "nirenpuku": "2連複", "nirentan": "2連単",
+          "sanrenpuku": "3連複", "sanrentan": "3連単"}
+    for r in t.itertuples(index=False):
+        lines.append(f"| {jp.get(r[0], r[0])} | {r[1]:.1f} | {r[2]} | {r[3]} | {r[4]} | {r[5]:.1f}% | {r[6]:.1f}% | {r[7]:.0f}〜{r[8]:.0f}% | {r[9]:.1f}% |")
+    lines += ["", "日別の明細は `<日付>_settled.csv`。自動更新（.github/workflows/live.yml）。"]
+    (REC / "SUMMARY.md").write_text("\n".join(lines) + "\n")
+    print("\n".join(lines))
 
 
 if __name__ == "__main__":
     cmd = sys.argv[1]
     day = sys.argv[2] if len(sys.argv) > 2 else today()
-    {"train": lambda: train(), "prepare": lambda: prepare(day), "run": lambda: run(day),
+    {"train": lambda: train(day), "prepare": lambda: prepare(day),
+     "run": lambda: run(day, *sys.argv[3:6]),
      "settle": lambda: settle(day)}[cmd]()
