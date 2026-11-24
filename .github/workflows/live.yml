@@ -78,6 +78,7 @@ jobs:
           key: state-${{ steps.p.outputs.day }}
 
       - name: 公式データを戻す
+        id: raw
         if: steps.state.outputs.cache-hit != 'true'
         uses: actions/cache/restore@v4
         with:
@@ -87,11 +88,25 @@ jobs:
           key: raw-${{ steps.p.outputs.day }}
           restore-keys: raw-
 
-      - name: 公式データを取得・当日の準備
-        if: steps.state.outputs.cache-hit != 'true'
+      # キャッシュが一度も無いとき（初回・長く止めた後）は、raw-data ブランチの初期コピーから始める。
+      # 公式サイトは1ファイル約10秒かかり、3年分を取り直すと1時間を超えるため
+      - name: 公式データの初期コピー
+        if: steps.state.outputs.cache-hit != 'true' && steps.raw.outputs.cache-matched-key == ''
         run: |
-          python3 tools/download.py 2023-01-01 ${{ steps.p.outputs.yesterday }} | tail -20
-          python3 tools/live.py prepare ${{ steps.p.outputs.day }}
+          git fetch -q --depth 1 origin raw-data
+          mkdir -p data/raw
+          git archive FETCH_HEAD | tar -x -C data/raw
+          ls data/raw/K | wc -l
+
+      - name: 公式データの不足分を取得
+        if: steps.state.outputs.cache-hit != 'true'
+        timeout-minutes: 30
+        run: python3 tools/download.py 2023-01-01 ${{ steps.p.outputs.yesterday }}
+
+      - name: 当日の準備
+        if: steps.state.outputs.cache-hit != 'true'
+        timeout-minutes: 40
+        run: python3 tools/live.py prepare ${{ steps.p.outputs.day }}
 
       - name: 公式データを保存
         if: steps.state.outputs.cache-hit != 'true'
