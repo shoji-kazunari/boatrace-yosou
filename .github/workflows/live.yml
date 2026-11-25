@@ -1,35 +1,32 @@
 # 締切前オッズでの紙上記録を毎日動かす（お金は賭けない）。
-# 1回の実行は6時間までなので、取得時刻で朝・昼・夕の3つに分ける。受け持ちは重ならない。
-#   朝   07:07 JST 開始 … 前日分の答え合わせ → 当日の準備（番組表・特徴量・週1回の学習）→ 〜12:30 のレース
-#   昼   12:07 JST 開始 … 12:30〜17:30 のレース
-#   夕   17:07 JST 開始 … 17:30〜 のレース（ナイター）
+#
+# GitHub の定時実行（schedule）は数時間遅れたり飛んだりするので、時刻合わせには使わない。
+# 代わりに「1回の実行が終わる直前に、次の回を自分で起動する」リレーで24時間つなぐ。
+#   - 各回は起動した時刻から約5時間半のあいだに締切5分前を迎えるレースを受け持つ（1回6時間までの制限のため）
+#   - その日のレースが残っていない時間帯（夜〜早朝）は、06:30 まで待ってから次を起動する
+#   - その日の初回だけ、前日分の答え合わせ・番組表の取得・特徴量づくり・（週1回の）学習をする
+# schedule は、リレーが何かの理由で切れたときに再開させるための保険（6時間おき）。
 # 準備した特徴量・モデル・公式データはキャッシュで次の回に渡す。記録は records/live/ にコミットする。
 name: live
 
 on:
   schedule:
-    - cron: "7 22 * * *"   # 07:07 JST
-    - cron: "7 3 * * *"    # 12:07 JST
-    - cron: "7 8 * * *"    # 17:07 JST
+    - cron: "41 */6 * * *"
   workflow_dispatch:
-    inputs:
-      part:
-        description: 受け持ち
-        type: choice
-        options: [morning, midday, evening]
-        default: morning
 
 permissions:
   contents: write
+  actions: write
 
+# 同時に動くのは1つだけ。保険の起動が重なっても、待ち行列は1つに畳まれる
 concurrency:
-  group: live-${{ github.event.schedule || inputs.part }}
+  group: live
   cancel-in-progress: false
 
 jobs:
   live:
     runs-on: ubuntu-latest
-    timeout-minutes: 355
+    timeout-minutes: 350
     env:
       TZ: Asia/Tokyo
     steps:
@@ -45,23 +42,18 @@ jobs:
       - name: 受け持ちと日付
         id: p
         run: |
-          case "${{ github.event.schedule }}" in
-            "7 22 * * *") part=morning ;;
-            "7 3 * * *")  part=midday ;;
-            "7 8 * * *")  part=evening ;;
-            *)            part="${{ inputs.part }}" ;;
-          esac
-          case "$part" in
-            morning) s=00:00; e=12:30 ;;
-            midday)  s=12:30; e=17:30 ;;
-            evening) s=17:30; e=24:00 ;;
-          esac
-          echo "part=$part" >> "$GITHUB_OUTPUT"
+          # 締切1分前まで取れるので、4分前から受け持つ（前の回との継ぎ目で取りこぼさない）
+          s=$(date -d '-4 min' +%H:%M)
+          [ "$(date -d '-4 min' +%Y%m%d)" = "$(date +%Y%m%d)" ] || s=00:00
+          e=$(date -d '+325 min' +%H:%M)
+          [ "$(date -d '+325 min' +%Y%m%d)" = "$(date +%Y%m%d)" ] || e=24:00
+          echo "part=$(date +%H%M)" >> "$GITHUB_OUTPUT"
           echo "start=$s" >> "$GITHUB_OUTPUT"
           echo "end=$e" >> "$GITHUB_OUTPUT"
           echo "day=$(date +%Y%m%d)" >> "$GITHUB_OUTPUT"
           echo "yesterday=$(date -d yesterday +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
-          echo "$part $s-$e $(date)"
+          echo "t0=$(date +%s)" >> "$GITHUB_OUTPUT"
+          echo "受け持ち $s-$e  $(date)"
 
       - name: モデルを戻す
         uses: actions/cache/restore@v4
@@ -172,6 +164,41 @@ jobs:
             sleep $((i * 10))
           done
           exit 1
+
+      - name: レースの無い時間帯は 06:30 まで待つ
+        if: success() || failure()
+        run: |
+          now=$(date +%s)
+          next=$(date -d "today 06:30" +%s)
+          [ "$now" -lt "$next" ] || next=$(date -d "tomorrow 06:30" +%s)
+          limit=$(( ${{ steps.p.outputs.t0 }} + 325 * 60 ))
+          # その日のレースが残っていない（最終の締切を過ぎた・レース一覧が無い）ときだけ待つ。
+          # 日中は受け持ちが終わったらすぐ次へ
+          left=$(python3 - <<'PY'
+          import datetime, pathlib, pandas as pd
+          now = datetime.datetime.now()
+          f = pathlib.Path(f"data/live/races_{now:%Y%m%d}.csv")
+          if now.hour < 6 or not f.exists():
+              print(0)
+          else:
+              dl = pd.read_csv(f).deadline
+              last = max(datetime.datetime.combine(now.date(), datetime.time(*map(int, d.split(":")))) for d in dl)
+              print(1 if now < last - datetime.timedelta(minutes=1) else 0)
+          PY
+          )
+          if [ "$left" = 0 ]; then
+            until=$(( next < limit ? next : limit ))
+            if [ "$until" -gt "$now" ]; then
+              echo "今日のレースは終了。$(date -d @$until +%H:%M) まで待つ"
+              sleep $(( until - now ))
+            fi
+          fi
+
+      - name: 次の回を起動
+        if: success() || failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run live.yml --ref main -R "${{ github.repository }}"
 
       - name: 取得したページを残す
         if: always()
